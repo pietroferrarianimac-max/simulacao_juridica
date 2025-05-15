@@ -13,7 +13,7 @@ from langchain_community.vectorstores import FAISS
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+
 
 import streamlit as st
 
@@ -147,7 +147,7 @@ def criar_ou_carregar_retriever(id_processo: str, arquivo_processo_especifico: s
     print(f"[RAG] Documentos divididos em {len(docs_divididos)} chunks.")
     
     try:
-        print("[RAG] Criando e salvando vector store FAISS em '{FAISS_INDEX_PATH}'.")
+        print(f"[RAG] Criando e salvando vector store FAISS em '{FAISS_INDEX_PATH}'.")
         vector_store = FAISS.from_documents(docs_divididos, embeddings_model)
         vector_store.save_local(FAISS_INDEX_PATH)
     except Exception as e:
@@ -182,48 +182,23 @@ class EstadoProcessual(TypedDict):
     manifestacao_autor_sem_provas: bool # Flag
     manifestacao_reu_sem_provas: bool # Flag
 
-    # (Continuação da Parte 1: Imports, Constantes, Utilitários RAG, LLM, EstadoProcessual já definidos)
-
 # --- 5. Mapa de Fluxo Processual (Rito Ordinário) ---
-# Este mapa define QUAL ETAPA um NÓ ATUAL deve executar,
-# baseado em QUEM foi o NÓ ANTERIOR e QUAL ETAPA o nó anterior CONCLUIU.
-# Chave: (nome_do_no_anterior, etapa_concluida_pelo_no_anterior, nome_do_no_atual_que_ira_rodar)
-# Valor: etapa_que_o_no_atual_deve_executar
 mapa_tarefa_no_atual: Dict[Tuple[Union[str, None], Union[str, None], str], str] = {
-    # 1. Início: Advogado do Autor faz a Petição Inicial
-    (None, None, ADVOGADO_AUTOR): ETAPA_PETICAO_INICIAL, # Ponto de entrada
-
-    # 2. Juiz recebe a Petição Inicial do Advogado Autor
+    (None, None, ADVOGADO_AUTOR): ETAPA_PETICAO_INICIAL,
     (ADVOGADO_AUTOR, ETAPA_PETICAO_INICIAL, JUIZ): ETAPA_DESPACHO_RECEBENDO_INICIAL,
-
-    # 3. Advogado do Réu recebe o Despacho do Juiz e contesta
     (JUIZ, ETAPA_DESPACHO_RECEBENDO_INICIAL, ADVOGADO_REU): ETAPA_CONTESTACAO,
-
-    # 4. Juiz recebe a Contestação do Réu e profere Decisão de Saneamento
-    (ADVOGADO_REU, ETAPA_CONTESTACAO, JUIZ): ETAPA_DECISAO_SANEAMENTO,
-
-    # 5. Advogado do Autor recebe a Decisão de Saneamento e se manifesta sobre provas
+    (ADVOGADO_REU, ETAPA_CONTESTACAO, JUIZ): ETAPA_DECISAO_SANEAMENTO, # Originalmente ia para Réplica, simplificado para Saneamento
     (JUIZ, ETAPA_DECISAO_SANEAMENTO, ADVOGADO_AUTOR): ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR,
-
-    # 6. Advogado do Réu recebe a manifestação do Autor (via Juiz, implicitamente) e também se manifesta
-    (ADVOGADO_AUTOR, ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR, ADVOGADO_REU): ETAPA_MANIFESTACAO_SEM_PROVAS_REU, # Adicione esta linha
-
-    # 7. Juiz recebe as manifestações das partes e profere Sentença
+    (ADVOGADO_AUTOR, ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR, ADVOGADO_REU): ETAPA_MANIFESTACAO_SEM_PROVAS_REU,
     (ADVOGADO_REU, ETAPA_MANIFESTACAO_SEM_PROVAS_REU, JUIZ): ETAPA_SENTENCA,
-
-    # 8. Fim do processo após sentença (Juiz sugere FIM)
-    # (JUIZ, ETAPA_SENTENCA, ETAPA_FIM_PROCESSO): ETAPA_FIM_PROCESSO # Não é uma tarefa, mas um estado final
 }
 
 # --- 6. Função de Roteamento Condicional (Router) ---
 def decidir_proximo_no_do_grafo(estado: EstadoProcessual):
-    """
-    Decide qual o próximo nó a ser executado com base na sugestão do nó anterior.
-    """
     proximo_ator_sugerido = estado.get("proximo_ator_sugerido_pelo_ultimo_no")
     etapa_concluida = estado.get("etapa_concluida_pelo_ultimo_no")
 
-    print(f"[Router] Estado recebido: {estado}") # Adicione esta linha
+    print(f"[Router] Estado recebido: { {k: v for k, v in estado.items() if k != 'retriever'} }")
     print(f"[Router] Decidindo próximo nó. Última etapa concluída: '{etapa_concluida}'. Próximo ator sugerido: '{proximo_ator_sugerido}'.")
 
     if proximo_ator_sugerido == ADVOGADO_AUTOR:
@@ -239,25 +214,18 @@ def decidir_proximo_no_do_grafo(estado: EstadoProcessual):
         print(f"[Router] ERRO: Próximo ator '{proximo_ator_sugerido}' desconhecido ou fluxo não previsto. Encerrando.")
         return END
 
-# --- 7. Esqueleto dos Agentes (Nós do Grafo) ---
-# Serão detalhados na Parte 3. Por enquanto, apenas a estrutura.
+# --- 7. Helpers e Agentes (Nós do Grafo) ---
 
 def criar_prompt_e_chain(template_string: str):
     prompt = ChatPromptTemplate.from_template(template_string)
     return prompt | llm | StrOutputParser()
 
 def helper_logica_inicial_no(estado: EstadoProcessual, nome_do_no_atual: str) -> str:
-    """
-    Ajuda cada nó a determinar qual etapa ele deve executar.
-    Retorna a string da etapa ou uma string de erro/vazia.
-    """
     nome_ultimo_no = estado.get("nome_do_ultimo_no_executado")
     etapa_ultimo_no = estado.get("etapa_concluida_pelo_ultimo_no")
-
     chave_mapa = (nome_ultimo_no, etapa_ultimo_no, nome_do_no_atual)
     
     if nome_ultimo_no is None and etapa_ultimo_no is None and nome_do_no_atual == ADVOGADO_AUTOR:
-        # Ponto de entrada especial para o primeiro nó do grafo
         print(f"[{nome_do_no_atual}] Ponto de entrada, definindo etapa como PETICAO_INICIAL.")
         return ETAPA_PETICAO_INICIAL
     
@@ -271,306 +239,10 @@ def helper_logica_inicial_no(estado: EstadoProcessual, nome_do_no_atual: str) ->
     print(f"[{nome_do_no_atual}] Iniciando. Etapa designada: {etapa_designada}.")
     return etapa_designada
 
-def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
-    etapa_atual_do_no = helper_logica_inicial_no(estado, ADVOGADO_AUTOR)
-    estado["etapa_a_ser_executada_neste_turno"] = etapa_atual_do_no
-    print(f"\n--- TURNO: {ADVOGADO_AUTOR} (Executando Etapa: {etapa_atual_do_no}) ---")
-
-    if etapa_atual_do_no == "ERRO_ETAPA_NAO_ENCONTRADA":
-        return {
-            "nome_do_ultimo_no_executado": ADVOGADO_AUTOR,
-            "etapa_concluida_pelo_ultimo_no": "ERRO_FLUXO",
-            "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO,
-            "documento_gerado_na_etapa_recente": "Erro de fluxo.",
-        }
-
-    documento_gerado = f"Documento padrão para {ADVOGADO_AUTOR} na etapa {etapa_atual_do_no} não gerado."
-    proximo_ator_logico = JUIZ
-    retriever = estado["retriever"]
-    id_processo = estado["id_processo"]
-    historico_formatado = "\n".join([f"- Etapa: {item['etapa']}, Ator: {item['ator']}:\n  Documento: {item['documento'][:150]}..." for item in estado.get("historico_completo", [])])
-    if not historico_formatado:
-        historico_formatado = "Este é o primeiro ato do processo."
-
-    query_fatos_caso = f"Resumo dos fatos e principais pontos do processo {id_processo}"
-    docs_fatos_caso = retriever.get_relevant_documents(
-        query=query_fatos_caso,
-        filter={"source_type": "processo_atual", "process_id": id_processo}
-    )
-    contexto_fatos_caso = "\n".join([doc.page_content for doc in docs_fatos_caso]) if docs_fatos_caso else "Nenhum detalhe factual específico do caso encontrado no RAG do processo_em_si."
-    print(f"[{ADVOGADO_AUTOR}-{etapa_atual_do_no}] Contexto do caso (RAG): {contexto_fatos_caso[:200]}...")
-
-    if etapa_atual_do_no == ETAPA_PETICAO_INICIAL:
-        query_modelo_pi = f"modelo de petição inicial completa para o caso {id_processo}"
-        docs_modelo_pi = retriever.get_relevant_documents(query=query_modelo_pi, filter={"source_type": "modelo_peticao"})
-        modelo_texto_guia = docs_modelo_pi[0].page_content if docs_modelo_pi else "ERRO RAG: Modelo de petição inicial não encontrado."
-
-        template_prompt = """
-        Você é um Advogado do Autor experiente e está elaborando uma Petição Inicial para o **Processo ID:** {id_processo}.
-        **Tarefa:** Elaborar a Petição Inicial completa e fundamentada para o caso.
-
-        **Contexto dos Fatos do Caso (extraído do arquivo do processo):**
-        {contexto_fatos_caso}
-
-        **Modelo/Guia de Petição Inicial (use como referência estrutural e de linguagem jurídica, mas adapte ao caso concreto):**
-        {modelo_texto_guia}
-
-        **Histórico Processual até o momento:**
-        {historico_formatado}
-        ---
-        Com base em todas as informações acima, redija a Petição Inicial. Seja completo, claro e objetivo.
-        Atenção aos fatos específicos do caso para argumentação.
-        Não inclua saudações genéricas no início ou fim se já estiverem no modelo.
-        Petição Inicial:
-        """
-        chain = criar_prompt_e_chain(template_prompt)
-        documento_gerado = chain.invoke({
-            "id_processo": id_processo,
-            "contexto_fatos_caso": contexto_fatos_caso,
-            "modelo_texto_guia": modelo_texto_guia,
-            "historico_formatado": historico_formatado
-        })
-        proximo_ator_logico = JUIZ
-    elif etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR:
-        # A decisão de saneamento deve estar no 'documento_gerado_na_etapa_recente'
-        decisao_saneamento_recebida = estado.get("documento_gerado_na_etapa_recente", "ERRO: Decisão de Saneamento não encontrada no estado.")
-        pontos_controvertidos = estado.get("pontos_controvertidos_saneamento", "Pontos controvertidos não detalhados.")
-
-        docs_modelo_manifest = retriever.get_relevant_documents(query="modelo de petição ou manifestação declarando não ter mais provas a produzir", filter={"source_type": "modelo_peticao"})
-        modelo_texto_guia = docs_modelo_manifest[0].page_content if docs_modelo_manifest else "ERRO RAG: Modelo de manifestação sem provas não encontrado."
-
-        template_prompt = """
-        Você é o Advogado do Autor. O juiz proferiu Decisão de Saneamento e intimou as partes a especificarem provas.
-        **Processo ID:** {id_processo}
-        **Tarefa:** Elaborar uma petição informando que o Autor não possui mais provas a produzir, requerendo o julgamento do feito no estado em que se encontra, ou protestando por memoriais se for o caso.
-
-        **Contexto dos Fatos do Caso (extraído do arquivo do processo):**
-        {contexto_fatos_caso}
-
-        **Decisão de Saneamento proferida pelo Juiz:**
-        {decisao_saneamento_recebida}
-        (Pontos Controvertidos principais: {pontos_controvertidos})
-
-        **Modelo/Guia de Manifestação (use como referência):**
-        {modelo_texto_guia}
-
-        **Histórico Processual até o momento:**
-        {historico_formatado}
-        ---
-        Redija a Petição de Manifestação do Autor.
-        Manifestação:
-        """
-        chain = criar_prompt_e_chain(template_prompt)
-        documento_gerado = chain.invoke({
-            "id_processo": id_processo,
-            "contexto_fatos_caso": contexto_fatos_caso,
-            "decisao_saneamento_recebida": decisao_saneamento_recebida,
-            "pontos_controvertidos": pontos_controvertidos,
-            "modelo_texto_guia": modelo_texto_guia,
-            "historico_formatado": historico_formatado
-        })
-        proximo_ator_logico = ADVOGADO_REU # Próximo é o réu se manifestar sobre provas
-
-    else:
-        print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {ADVOGADO_AUTOR} não implementada completamente.")
-        documento_gerado = f"Conteúdo para {ADVOGADO_AUTOR} na etapa {etapa_atual_do_no} não foi gerado pela lógica específica."
-        # Definir um próximo ator padrão ou de erro se a etapa não for tratada
-        proximo_ator_logico = JUIZ # Ou ETAPA_FIM_PROCESSO em caso de erro irrecuperável
-
-    print(f"[{ADVOGADO_AUTOR}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
-
-    novo_historico_item = {"etapa": etapa_atual_do_no, "ator": ADVOGADO_AUTOR, "documento": documento_gerado}
-    historico_atualizado = estado.get("historico_completo", []) + [novo_historico_item]
-
-    return {
-        "nome_do_ultimo_no_executado": ADVOGADO_AUTOR,
-        "etapa_concluida_pelo_ultimo_no": etapa_atual_do_no,
-        "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
-        "documento_gerado_na_etapa_recente": documento_gerado,
-        "historico_completo": historico_atualizado,
-        "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"),
-        "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR),
-        "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),
-        "id_processo": estado["id_processo"],
-        "retriever": estado["retriever"],
-        "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
-    }
-
-def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
-    # A lógica detalhada virá na Parte 3
-    etapa_atual_do_no = helper_logica_inicial_no(estado, JUIZ)
-    estado["etapa_a_ser_executada_neste_turno"] = etapa_atual_do_no
-    print(f"\n--- TURNO: {JUIZ} (Executando Etapa: {etapa_atual_do_no}) ---")
-
-    if etapa_atual_do_no == "ERRO_ETAPA_NAO_ENCONTRADA":
-         return {
-            "nome_do_ultimo_no_executado": JUIZ,
-            "etapa_concluida_pelo_ultimo_no": "ERRO_FLUXO",
-            "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO,
-            "documento_gerado_na_etapa_recente": "Erro de fluxo.",
-        }
-
-    # Lógica específica para cada etapa do JUIZ (DESPACHO_RECEBENDO_INICIAL, etc.)
-    # ... a ser preenchida ...
-    documento_gerado = f"Documento simulado para {JUIZ} na etapa {etapa_atual_do_no}"
-    proximo_ator_logico = ADVOGADO_REU # Placeholder
-    pontos_controvertidos = estado.get("pontos_controvertidos_saneamento")
-
-    if etapa_atual_do_no == ETAPA_DESPACHO_RECEBENDO_INICIAL:
-        proximo_ator_logico = ADVOGADO_REU
-    elif etapa_atual_do_no == ETAPA_DECISAO_SANEAMENTO:
-        proximo_ator_logico = ADVOGADO_AUTOR # Autor se manifesta sobre provas primeiro
-        pontos_controvertidos = "Ponto X e Ponto Y definidos no saneamento (simulado)" # Juiz define aqui
-    elif etapa_atual_do_no == ETAPA_SENTENCA:
-        proximo_ator_logico = ETAPA_FIM_PROCESSO # Fim
-    # ... outras condições ...
-
-    print(f"{JUIZ} ({etapa_atual_do_no}) gerou: {documento_gerado[:100]}...")
-    novo_historico_item = {"etapa": etapa_atual_do_no, "ator": JUIZ, "documento": documento_gerado}
-
-    return {
-        "nome_do_ultimo_no_executado": JUIZ,
-        "etapa_concluida_pelo_ultimo_no": etapa_atual_do_no,
-        "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
-        "documento_gerado_na_etapa_recente": documento_gerado,
-        "historico_completo": estado["historico_completo"] + [novo_historico_item],
-        "pontos_controvertidos_saneamento": pontos_controvertidos,
-        "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False),
-        "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),
-    }
-
-def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
-    etapa_atual_do_no = helper_logica_inicial_no(estado, ADVOGADO_REU)
-    print(f"\n--- TURNO: {ADVOGADO_REU} (Executando Etapa: {etapa_atual_do_no}) ---")
-
-    if etapa_atual_do_no == "ERRO_ETAPA_NAO_ENCONTRADA":
-        print(f"ERRO FATAL: {ADVOGADO_REU} não conseguiu determinar sua etapa. Encerrando fluxo.")
-        return {
-            "nome_do_ultimo_no_executado": ADVOGADO_REU,
-            "etapa_concluida_pelo_ultimo_no": "ERRO_FLUXO_IRRECUPERAVEL",
-            "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO,
-            "documento_gerado_na_etapa_recente": "Erro crítico de fluxo para o Advogado do Réu.",
-            "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": ADVOGADO_REU, "documento": "Erro de fluxo irrecuperável do Advogado Réu."}],
-        }
-
-    documento_gerado = f"Documento padrão para {ADVOGADO_REU} na etapa {etapa_atual_do_no} não gerado."
-    proximo_ator_logico = JUIZ
-    retriever = estado["retriever"]
-    id_processo = estado["id_processo"]
-    historico_formatado = "\n".join([f"- Etapa: {item['etapa']}, Ator: {item['ator']}:\n  Documento: {item['documento'][:150]}..." for item in estado.get("historico_completo", [])])
-    if not historico_formatado:
-        historico_formatado = "Histórico processual não disponível."
-
-    documento_relevante_anterior = estado.get("documento_gerado_na_etapa_recente", "Nenhum documento recente para análise imediata.")
-
-    query_fatos_caso = f"Resumo dos fatos e principais pontos do processo {id_processo} sob a perspectiva da defesa"
-    docs_fatos_caso = retriever.get_relevant_documents(
-        query=query_fatos_caso,
-        filter={"source_type": "processo_atual", "process_id": id_processo}
-    )
-    contexto_fatos_caso = "\n".join([doc.page_content for doc in docs_fatos_caso]) if docs_fatos_caso else "Nenhum detalhe factual específico do caso encontrado no RAG do processo_em_si para a defesa."
-    print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Contexto do caso (RAG): {contexto_fatos_caso[:200]}...")
-
-    if etapa_atual_do_no == ETAPA_CONTESTACAO:
-        peticao_inicial_autor = "Petição Inicial não encontrada no histórico para contestação."
-        for item in reversed(estado.get("historico_completo", [])):
-            if item["etapa"] == ETAPA_PETICAO_INICIAL and item["ator"] == ADVOGADO_AUTOR:
-                peticao_inicial_autor = item["documento"]
-                break
-
-        query_modelo_contestacao = f"modelo de contestação cível completa para o caso {id_processo}"
-        docs_modelo_contestacao = retriever.get_relevant_documents(query=query_modelo_contestacao, filter={"source_type": "modelo_peticao"})
-        modelo_texto_guia = docs_modelo_contestacao[0].page_content if docs_modelo_contestacao else "ERRO RAG: Modelo de contestação não encontrado."
-
-        template_prompt = """
-        Você é um Advogado do Réu experiente e está elaborando uma Contestação para o **Processo ID:** {id_processo}.
-        **Tarefa:** Analisar a Petição Inicial do Autor e elaborar uma Contestação completa, rebatendo os argumentos do autor, apresentando preliminares (se houver) e o mérito da defesa.
-
-        **Contexto dos Fatos do Caso (do RAG, com foco na perspectiva da defesa):**
-        {contexto_fatos_caso}
-
-        **Despacho Judicial Recebido (ex: citação):**
-        {despacho_judicial}
-
-        **Petição Inicial do Autor (documento a ser contestado):**
-        {peticao_inicial_autor}
-
-        **Modelo/Guia de Contestação (use como referência estrutural e de linguagem):**
-        {modelo_texto_guia}
-
-        **Histórico Processual até o momento:**
-        {historico_formatado}
-        ---
-        Com base em todas as informações acima, redija a Contestação. Seja completo, claro e objetivo.
-        Atenção aos fatos específicos do caso para a argumentação da defesa.
-        Contestação:
-        """
-        chain = criar_prompt_e_chain(template_prompt)
-        documento_gerado = chain.invoke({
-            "id_processo": id_processo,
-            "contexto_fatos_caso": contexto_fatos_caso,
-            "despacho_judicial": documento_relevante_anterior,
-            "peticao_inicial_autor": peticao_inicial_autor,
-            "modelo_texto_guia": modelo_texto_guia,
-            "historico_formatado": historico_formatado
-        })
-        proximo_ator_logico = JUIZ
-    elif etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_REU:
-        # Lógica para a manifestação do réu sobre não ter provas virá em um próximo turno
-        documento_gerado = f"Documento simulado para {ADVOGADO_REU} na etapa {etapa_atual_do_no} não gerado."
-        proximo_ator_logico = JUIZ
-    else:
-        print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {ADVOGADO_REU} não implementada completamente.")
-        documento_gerado = f"Conteúdo para {ADVOGADO_REU} na etapa {etapa_atual_do_no} não foi gerado pela lógica específica."
-        proximo_ator_logico = JUIZ
-
-    print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
-
-    novo_historico_item = {"etapa": etapa_atual_do_no, "ator": ADVOGADO_REU, "documento": documento_gerado}
-    historico_atualizado = estado.get("historico_completo", []) + [novo_historico_item]
-
-    return {
-        "nome_do_ultimo_no_executado": ADVOGADO_REU,
-        "etapa_concluida_pelo_ultimo_no": etapa_atual_do_no,
-        "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
-        "documento_gerado_na_etapa_recente": documento_gerado,
-        "historico_completo": historico_atualizado,
-        "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"),
-        "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False),
-        "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_REU),
-        "id_processo": estado["id_processo"],
-        "retriever": estado["retriever"],
-        "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
-    }
-
-
-# --- 8. Construção do Grafo LangGraph ---
-workflow = StateGraph(EstadoProcessual)
-
-workflow.add_node(ADVOGADO_AUTOR, agente_advogado_autor)
-workflow.add_node(JUIZ, agente_juiz)
-workflow.add_node(ADVOGADO_REU, agente_advogado_reu)
-
-workflow.set_entry_point(ADVOGADO_AUTOR)
-
-# Mapeamento para as conditional_edges:
-# O valor retornado pela função router (ADVOGADO_AUTOR, JUIZ, ADVOGADO_REU, ou END)
-# deve corresponder às chaves neste dicionário.
-roteamento_mapa_edges = {
-    ADVOGADO_AUTOR: ADVOGADO_AUTOR,
-    JUIZ: JUIZ,
-    ADVOGADO_REU: ADVOGADO_REU,
-    END: END
-}
-
-workflow.add_conditional_edges(ADVOGADO_AUTOR, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
-workflow.add_conditional_edges(JUIZ, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
-workflow.add_conditional_edges(ADVOGADO_REU, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
-
-app = workflow.compile()
+# (Definições dos agentes ADVOGADO_AUTOR, JUIZ, ADVOGADO_REU - Versões Completas)
 
 def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
-    print(f"[DEBUG ADVOGADO_AUTOR] Etapa atual do nó: {estado.get('etapa_a_ser_executada_neste_turno')}")
+    # print(f"[DEBUG ADVOGADO_AUTOR] Etapa atual do nó: {estado.get('etapa_a_ser_executada_neste_turno')}") # Redundante com helper
     etapa_atual_do_no = helper_logica_inicial_no(estado, ADVOGADO_AUTOR)
     # estado["etapa_a_ser_executada_neste_turno"] = etapa_atual_do_no # O helper já loga isso.
 
@@ -584,6 +256,12 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
             "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO, # Sinaliza fim para o router
             "documento_gerado_na_etapa_recente": "Erro crítico de fluxo.",
             "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": ADVOGADO_AUTOR, "documento": "Erro de fluxo irrecuperável."}],
+            "id_processo": estado.get("id_processo", "ID_DESCONHECIDO"), # Preservar estado
+            "retriever": estado.get("retriever"),
+            "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"),
+            "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False),
+            "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),
+            "etapa_a_ser_executada_neste_turno": "ERRO_FLUXO_IRRECUPERAVEL"
         }
 
     documento_gerado = f"Documento padrão para {ADVOGADO_AUTOR} na etapa {etapa_atual_do_no} não gerado."
@@ -595,7 +273,6 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
         historico_formatado = "Este é o primeiro ato do processo."
 
     # --- Lógica de RAG para contexto do caso (comum a várias etapas) ---
-    # Tenta buscar fatos do processo. Pode ser uma query genérica ou mais específica.
     query_fatos_caso = f"Resumo dos fatos e principais pontos do processo {id_processo}"
     docs_fatos_caso = retriever.get_relevant_documents(
         query=query_fatos_caso,
@@ -606,7 +283,6 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
 
     # --- Tratamento específico para cada etapa do Advogado Autor ---
     if etapa_atual_do_no == ETAPA_PETICAO_INICIAL:
-        # RAG para modelo de Petição Inicial
         docs_modelo_pi = retriever.get_relevant_documents(query="modelo de petição inicial completa", filter={"source_type": "modelo_peticao"})
         modelo_texto_guia = docs_modelo_pi[0].page_content if docs_modelo_pi else "ERRO RAG: Modelo de petição inicial não encontrado."
         
@@ -638,9 +314,7 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
         })
         proximo_ator_logico = JUIZ
 
-
     elif etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR:
-        # A decisão de saneamento deve estar no 'documento_gerado_na_etapa_recente'
         decisao_saneamento_recebida = estado.get("documento_gerado_na_etapa_recente", "ERRO: Decisão de Saneamento não encontrada no estado.")
         pontos_controvertidos = estado.get("pontos_controvertidos_saneamento", "Pontos controvertidos não detalhados.")
 
@@ -682,7 +356,6 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
     else:
         print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {ADVOGADO_AUTOR} não implementada completamente.")
         documento_gerado = f"Conteúdo para {ADVOGADO_AUTOR} na etapa {etapa_atual_do_no} não foi gerado pela lógica específica."
-        # Definir um próximo ator padrão ou de erro se a etapa não for tratada
         proximo_ator_logico = JUIZ # Ou ETAPA_FIM_PROCESSO em caso de erro irrecuperável
 
     print(f"[{ADVOGADO_AUTOR}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
@@ -699,17 +372,10 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
         "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"), # Preserva se já existia
         "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR),
         "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),
-        # Preservar outros campos do estado que não foram modificados diretamente
         "id_processo": estado["id_processo"],
         "retriever": estado["retriever"],
-        "etapa_a_ser_executada_neste_turno": etapa_atual_do_no, # A etapa que este nó acabou de executar
+        "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
     }
-
-# (Continuação das Partes 1, 2 e 3.1)
-# As definições de ADVOGADO_AUTOR, JUIZ, ADVOGADO_REU,
-# ETAPA_DESPACHO_RECEBENDO_INICIAL, ETAPA_DECISAO_SANEAMENTO, ETAPA_SENTENCA, ETAPA_FIM_PROCESSO etc.
-# llm, helper_logica_inicial_no, criar_prompt_e_chain
-# já devem existir no seu script.
 
 def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
     etapa_atual_do_no = helper_logica_inicial_no(estado, JUIZ)
@@ -725,6 +391,12 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
             "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO,
             "documento_gerado_na_etapa_recente": "Erro crítico de fluxo para o Juiz.",
             "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": JUIZ, "documento": "Erro de fluxo irrecuperável do Juiz."}],
+            "id_processo": estado.get("id_processo", "ID_DESCONHECIDO"), # Preservar estado
+            "retriever": estado.get("retriever"),
+            "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"),
+            "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False),
+            "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),
+            "etapa_a_ser_executada_neste_turno": "ERRO_FLUXO_IRRECUPERAVEL"
         }
 
     documento_gerado = f"Decisão padrão para {JUIZ} na etapa {etapa_atual_do_no} não gerada."
@@ -732,12 +404,11 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
     retriever = estado["retriever"]
     id_processo = estado["id_processo"]
     historico_formatado = "\n".join([f"- Etapa: {item['etapa']}, Ator: {item['ator']}:\n  Documento: {item['documento'][:150]}..." for item in estado.get("historico_completo", [])])
-    if not historico_formatado: # Deveria sempre ter histórico se o juiz está atuando após a PI
+    if not historico_formatado: 
         historico_formatado = "Histórico processual não disponível ou PI ainda não processada."
 
     documento_da_parte_para_analise = estado.get("documento_gerado_na_etapa_recente", "Nenhuma petição recente das partes para análise.")
     
-    # --- Lógica de RAG para contexto do caso (comum a várias etapas) ---
     query_fatos_caso = f"Resumo dos fatos e principais pontos do processo {id_processo} para decisão judicial"
     docs_fatos_caso = retriever.get_relevant_documents(
         query=query_fatos_caso,
@@ -746,11 +417,9 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
     contexto_fatos_caso = "\n".join([doc.page_content for doc in docs_fatos_caso]) if docs_fatos_caso else "Nenhum detalhe factual específico do caso encontrado no RAG do processo_em_si."
     print(f"[{JUIZ}-{etapa_atual_do_no}] Contexto do caso (RAG): {contexto_fatos_caso[:200]}...")
     
-    pontos_controvertidos_definidos = estado.get("pontos_controvertidos_saneamento") # Mantém se já existia
+    pontos_controvertidos_definidos = estado.get("pontos_controvertidos_saneamento") 
 
-    # --- Tratamento específico para cada etapa do Juiz ---
     if etapa_atual_do_no == ETAPA_DESPACHO_RECEBENDO_INICIAL:
-        # Petição Inicial está em 'documento_da_parte_para_analise'
         docs_modelo_despacho = retriever.get_relevant_documents(query="modelo de despacho judicial recebendo petição inicial e citando o réu", filter={"source_type": "modelo_juiz"})
         modelo_texto_guia = docs_modelo_despacho[0].page_content if docs_modelo_despacho else "ERRO RAG: Modelo de despacho inicial não encontrado."
 
@@ -782,31 +451,27 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado
         })
-        proximo_ator_logico = ADVOGADO_REU # Após despacho inicial, réu é citado para contestar
+        proximo_ator_logico = ADVOGADO_REU
 
     elif etapa_atual_do_no == ETAPA_DECISAO_SANEAMENTO:
-        # Réplica do autor (ou ausência dela) está em 'documento_da_parte_para_analise'
-        # Também pode considerar a contestação do réu, que está no histórico.
-        # Vamos focar no estado atual e no que o LLM pode inferir do histórico geral.
-        
         docs_modelo_saneamento = retriever.get_relevant_documents(query="modelo de decisão de saneamento e organização do processo", filter={"source_type": "modelo_juiz"})
         modelo_texto_guia = docs_modelo_saneamento[0].page_content if docs_modelo_saneamento else "ERRO RAG: Modelo de decisão de saneamento não encontrado."
 
         template_prompt = """
-        Você é um Juiz de Direito e o processo está na fase de saneamento, após petição inicial, contestação e réplica.
+        Você é um Juiz de Direito e o processo está na fase de saneamento, após petição inicial e contestação (e eventual réplica, que deve ser inferida do histórico se aplicável).
         **Processo ID:** {id_processo}
         **Tarefa:** Proferir uma Decisão de Saneamento e Organização do Processo. Defina as questões processuais pendentes, as questões de fato sobre as quais recairá a atividade probatória (pontos controvertidos), distribua o ônus da prova e, se for o caso, designe audiência ou determine as provas a serem produzidas.
 
         **Contexto dos Fatos do Caso (extraído do arquivo do processo):**
         {contexto_fatos_caso}
         
-        **Última manifestação relevante das partes (ex: Réplica do Autor):**
+        **Última manifestação relevante das partes (ex: Contestação do Réu ou Réplica do Autor):**
         {ultima_peticao_partes}
 
         **Modelo/Guia de Decisão de Saneamento (use como referência):**
         {modelo_texto_guia}
         
-        **Histórico Processual Completo (incluindo PI, Contestação, Réplica):**
+        **Histórico Processual Completo (incluindo PI, Contestação, etc.):**
         {historico_formatado}
         ---
         Com base nisso, redija a Decisão de Saneamento.
@@ -817,19 +482,16 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
         documento_gerado = chain.invoke({
             "id_processo": id_processo,
             "contexto_fatos_caso": contexto_fatos_caso,
-            "ultima_peticao_partes": documento_da_parte_para_analise,
+            "ultima_peticao_partes": documento_da_parte_para_analise, # Esta é a contestação do réu
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado
         })
-        proximo_ator_logico = ADVOGADO_AUTOR # Partes são intimadas a especificar provas, começando pelo autor.
+        proximo_ator_logico = ADVOGADO_AUTOR 
         
-        # Extrair pontos controvertidos da decisão gerada (simplificado - idealmente usaríamos técnicas de NLP)
-        # Por agora, vamos assumir que o LLM os formata de uma maneira que podemos extrair ou pedir ao LLM para listar.
-        # Para o MVP, pode ser um placeholder ou uma tentativa simples de extração.
         try:
             inicio_pc = documento_gerado.upper().find("PONTOS CONTROVERTIDOS:")
             if inicio_pc != -1:
-                fim_pc = documento_gerado.find("\n\n", inicio_pc) # Tenta encontrar o fim da seção
+                fim_pc = documento_gerado.find("\n\n", inicio_pc) 
                 if fim_pc == -1: fim_pc = len(documento_gerado)
                 pontos_controvertidos_definidos = documento_gerado[inicio_pc + len("PONTOS CONTROVERTIDOS:"):fim_pc].strip()
             else:
@@ -838,11 +500,7 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
             pontos_controvertidos_definidos = "Erro ao tentar extrair pontos controvertidos."
         print(f"[{JUIZ}-{etapa_atual_do_no}] Pontos Controvertidos extraídos/definidos: {pontos_controvertidos_definidos}")
 
-
     elif etapa_atual_do_no == ETAPA_SENTENCA:
-        # Manifestações das partes sobre não ter mais provas estão no histórico.
-        # O 'documento_da_parte_para_analise' seria a última manifestação (do réu).
-        
         docs_modelo_sentenca = retriever.get_relevant_documents(query="modelo de sentença judicial cível", filter={"source_type": "modelo_juiz"})
         modelo_texto_guia = docs_modelo_sentenca[0].page_content if docs_modelo_sentenca else "ERRO RAG: Modelo de sentença não encontrado."
 
@@ -878,12 +536,12 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado
         })
-        proximo_ator_logico = ETAPA_FIM_PROCESSO # Após a sentença, o fluxo principal do rito ordinário se encerra aqui.
+        proximo_ator_logico = ETAPA_FIM_PROCESSO
 
     else:
         print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {JUIZ} não implementada completamente.")
         documento_gerado = f"Conteúdo para {JUIZ} na etapa {etapa_atual_do_no} não foi gerado pela lógica específica."
-        proximo_ator_logico = ETAPA_FIM_PROCESSO # Erro ou etapa não tratada leva ao fim
+        proximo_ator_logico = ETAPA_FIM_PROCESSO 
 
     print(f"[{JUIZ}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
 
@@ -896,20 +554,13 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
         "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
         "documento_gerado_na_etapa_recente": documento_gerado,
         "historico_completo": historico_atualizado,
-        "pontos_controvertidos_saneamento": pontos_controvertidos_definidos, # Atualiza se foi definido no saneamento
-        "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False), # Preserva
-        "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),   # Preserva
-        # Preservar outros campos do estado
+        "pontos_controvertidos_saneamento": pontos_controvertidos_definidos,
+        "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False), 
+        "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),   
         "id_processo": estado["id_processo"],
         "retriever": estado["retriever"],
         "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
     }
-
-# (Continuação das Partes 1, 2, 3.1 e 3.2)
-# As definições de ADVOGADO_AUTOR, JUIZ, ADVOGADO_REU,
-# ETAPA_CONTESTACAO, ETAPA_MANIFESTACAO_SEM_PROVAS_REU, etc.
-# llm, helper_logica_inicial_no, criar_prompt_e_chain
-# já devem existir no seu script.
 
 def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
     etapa_atual_do_no = helper_logica_inicial_no(estado, ADVOGADO_REU)
@@ -925,6 +576,12 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
             "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO,
             "documento_gerado_na_etapa_recente": "Erro crítico de fluxo para o Advogado do Réu.",
             "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": ADVOGADO_REU, "documento": "Erro de fluxo irrecuperável do Advogado Réu."}],
+            "id_processo": estado.get("id_processo", "ID_DESCONHECIDO"), # Preservar estado
+            "retriever": estado.get("retriever"),
+            "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"),
+            "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False),
+            "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False),
+            "etapa_a_ser_executada_neste_turno": "ERRO_FLUXO_IRRECUPERAVEL"
         }
 
     documento_gerado = f"Documento padrão para {ADVOGADO_REU} na etapa {etapa_atual_do_no} não gerado."
@@ -933,12 +590,10 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
     id_processo = estado["id_processo"]
     historico_formatado = "\n".join([f"- Etapa: {item['etapa']}, Ator: {item['ator']}:\n  Documento: {item['documento'][:150]}..." for item in estado.get("historico_completo", [])])
     if not historico_formatado:
-        historico_formatado = "Histórico processual não disponível." # Improvável nesta fase para o réu
+        historico_formatado = "Histórico processual não disponível."
 
-    # Documento do juiz ou da parte contrária para análise
     documento_relevante_anterior = estado.get("documento_gerado_na_etapa_recente", "Nenhum documento recente para análise imediata.")
     
-    # --- Lógica de RAG para contexto do caso (comum a várias etapas) ---
     query_fatos_caso = f"Resumo dos fatos e principais pontos do processo {id_processo} sob a perspectiva da defesa"
     docs_fatos_caso = retriever.get_relevant_documents(
         query=query_fatos_caso,
@@ -947,11 +602,8 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
     contexto_fatos_caso = "\n".join([doc.page_content for doc in docs_fatos_caso]) if docs_fatos_caso else "Nenhum detalhe factual específico do caso encontrado no RAG do processo_em_si para a defesa."
     print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Contexto do caso (RAG): {contexto_fatos_caso[:200]}...")
 
-    # --- Tratamento específico para cada etapa do Advogado Réu ---
     if etapa_atual_do_no == ETAPA_CONTESTACAO:
-        # O despacho do juiz (citando o réu) está em 'documento_relevante_anterior'.
-        # A Petição Inicial original do autor está no histórico.
-        peticao_inicial_autor = "Petição Inicial não encontrada no histórico para contestação." # Default
+        peticao_inicial_autor = "Petição Inicial não encontrada no histórico para contestação." 
         for item in reversed(estado.get("historico_completo", [])):
             if item["etapa"] == ETAPA_PETICAO_INICIAL and item["ator"] == ADVOGADO_AUTOR:
                 peticao_inicial_autor = item["documento"]
@@ -988,21 +640,19 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
         documento_gerado = chain.invoke({
             "id_processo": id_processo,
             "contexto_fatos_caso": contexto_fatos_caso,
-            "despacho_judicial": documento_relevante_anterior,
+            "despacho_judicial": documento_relevante_anterior, # Este é o despacho do juiz recebendo a inicial
             "peticao_inicial_autor": peticao_inicial_autor,
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado
         })
-        proximo_ator_logico = ADVOGADO_AUTOR # Após contestação, autor tem direito à réplica
+        proximo_ator_logico = JUIZ # Após contestação, juiz decide sobre saneamento (no fluxo simplificado). Poderia ser réplica do autor.
 
     elif etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_REU:
-        # A manifestação do autor sobre não ter provas está em 'documento_relevante_anterior'.
-        # A decisão de saneamento também é importante e está no histórico ou em 'pontos_controvertidos_saneamento'.
-        manifestacao_autor_sem_provas_doc = documento_relevante_anterior
-        decisao_saneamento_texto = "Decisão de Saneamento não encontrada no histórico recente." # Default
+        manifestacao_autor_sem_provas_doc = documento_relevante_anterior # Manifestação do autor
+        decisao_saneamento_texto = "Decisão de Saneamento não encontrada no histórico recente." 
         if estado.get("pontos_controvertidos_saneamento"):
              decisao_saneamento_texto = f"Decisão de Saneamento anterior definiu: {estado['pontos_controvertidos_saneamento']}"
-        else: # Tenta buscar no histórico
+        else: 
             for item in reversed(estado.get("historico_completo", [])):
                 if item["etapa"] == ETAPA_DECISAO_SANEAMENTO and item["ator"] == JUIZ:
                     decisao_saneamento_texto = item["documento"]
@@ -1043,12 +693,12 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado
         })
-        proximo_ator_logico = JUIZ # Após ambas as partes dizerem não ter provas, processo vai para sentença
+        proximo_ator_logico = JUIZ 
 
     else:
         print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {ADVOGADO_REU} não implementada completamente.")
         documento_gerado = f"Conteúdo para {ADVOGADO_REU} na etapa {etapa_atual_do_no} não foi gerado pela lógica específica."
-        proximo_ator_logico = JUIZ # Default para erro ou etapa não tratada
+        proximo_ator_logico = JUIZ 
 
     print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
     
@@ -1061,47 +711,78 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
         "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
         "documento_gerado_na_etapa_recente": documento_gerado,
         "historico_completo": historico_atualizado,
-        "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"), # Preserva
-        "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False), # Preserva
+        "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento"), 
+        "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False), 
         "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_REU),
-        # Preservar outros campos do estado
         "id_processo": estado["id_processo"],
         "retriever": estado["retriever"],
         "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
     }
 
-# (Continuação das Partes 1, 2, 3.1, 3.2 e 3.3)
-# Todas as definições anteriores (imports, constantes, RAG, LLM, Estado, Mapa, Agentes, Grafo)
-# já devem estar presentes no script.
+# --- 8. Construção do Grafo LangGraph ---
+workflow = StateGraph(EstadoProcessual)
+
+workflow.add_node(ADVOGADO_AUTOR, agente_advogado_autor)
+workflow.add_node(JUIZ, agente_juiz)
+workflow.add_node(ADVOGADO_REU, agente_advogado_reu)
+
+workflow.set_entry_point(ADVOGADO_AUTOR)
+
+roteamento_mapa_edges = {
+    ADVOGADO_AUTOR: ADVOGADO_AUTOR,
+    JUIZ: JUIZ,
+    ADVOGADO_REU: ADVOGADO_REU,
+    END: END
+}
+
+workflow.add_conditional_edges(ADVOGADO_AUTOR, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
+workflow.add_conditional_edges(JUIZ, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
+workflow.add_conditional_edges(ADVOGADO_REU, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
+
+app = workflow.compile()
 
 # --- 9. Execução da Simulação com Streamlit ---
 if __name__ == "__main__":
+    st.set_page_config(layout="wide")
     st.title("Simulação Jurídica Avançada")
     st.subheader("Rito Ordinário do CPC")
+
+    # Inicializar session_state para visualização de documentos
+    if 'doc_visualizado' not in st.session_state:
+        st.session_state.doc_visualizado = None
+        st.session_state.doc_visualizado_titulo = ""
+    if 'expand_all_steps' not in st.session_state:
+        st.session_state.expand_all_steps = True
+    if 'expand_all_history' not in st.session_state: # Para os expanders detalhados
+        st.session_state.expand_all_history = False
 
     id_processo_simulado = st.text_input("ID do Processo:", "caso_001")
     arquivo_processo_upload = st.file_uploader("Carregar Arquivo do Processo (.docx):", type=["docx"])
 
+    # Placeholder para o documento completo (será usado pela timeline e pelos expanders)
+    doc_completo_placeholder = st.empty()
+
     if arquivo_processo_upload is not None:
-        # Salvar o arquivo temporariamente para que a função carregar_documentos_docx possa acessá-lo
-        nome_arquivo_temporario = f"temp_{id_processo_simulado}_processo.docx"
-        with open(nome_arquivo_temporario, "wb") as f:
+        # ... (lógica de upload e inicialização do retriever como antes) ...
+        nome_arquivo_temporario = f"temp_{id_processo_simulado}_{arquivo_processo_upload.name}"
+        caminho_temp_salvo = os.path.join(PATH_PROCESSO_EM_SI, nome_arquivo_temporario)
+        
+        os.makedirs(PATH_PROCESSO_EM_SI, exist_ok=True)
+        
+        with open(caminho_temp_salvo, "wb") as f:
             f.write(arquivo_processo_upload.read())
 
-        print(f"--- INICIANDO SIMULAÇÃO JURÍDICA AVANÇADA PARA O PROCESSO: {id_processo_simulado} ---")
-        print(f"--- Rito Ordinário do CPC ---")
+        st.markdown(f"--- INICIANDO SIMULAÇÃO PARA O PROCESSO: **{id_processo_simulado}** ---")
 
         retriever_do_caso = None
         try:
-            print("\n[Main] Tentando inicializar o sistema RAG (Retriever)...")
-            retriever_do_caso = criar_ou_carregar_retriever(id_processo_simulado, nome_arquivo_temporario)
-            print("[Main] Sistema RAG inicializado com sucesso.")
+            with st.spinner("Inicializando sistema RAG e carregando documentos..."):
+                retriever_do_caso = criar_ou_carregar_retriever(id_processo_simulado, nome_arquivo_temporario)
+            st.success("Sistema RAG inicializado com sucesso.")
         except Exception as e:
-            st.error(f"ERRO FATAL: Falha crítica ao inicializar o sistema RAG. Encerrando. Detalhe do erro: {e}")
-            print(f"[Main] ERRO FATAL: Falha crítica ao inicializar o sistema RAG. Encerrando.")
-            print(f"Detalhe do erro: {e}")
-            print("Verifique se as pastas de dados existem, se o arquivo .docx está correto e se a API de embeddings está acessível.")
-            os.remove(nome_arquivo_temporario) # Limpar arquivo temporário em caso de erro
+            st.error(f"ERRO FATAL: Falha crítica ao inicializar o sistema RAG. Detalhe: {e}")
+            if os.path.exists(caminho_temp_salvo):
+                os.remove(caminho_temp_salvo) 
             st.stop()
 
         estado_inicial = EstadoProcessual(
@@ -1117,115 +798,157 @@ if __name__ == "__main__":
             manifestacao_reu_sem_provas=False,
             etapa_a_ser_executada_neste_turno=""
         )
-
-        st.subheader("Execução da Simulação:")
+        # ... (lógica da execução da simulação com app.stream e st.expander para os passos como antes) ...
+        st.subheader("Acompanhamento da Simulação:")
+        if st.button("Alternar Expansão dos Passos da Execução"):
+            st.session_state.expand_all_steps = not st.session_state.expand_all_steps
         progress_bar = st.progress(0)
-        log_area = st.empty()
-        historico_area = st.empty()
-
-        print("\n[Main] Estado inicial definido. Compilando e iniciando a execução do grafo LangGraph...")
-
-        max_passos_simulacao = 15
+        steps_container = st.container()
+        max_passos_simulacao = 15 
         passo_atual_simulacao = 0
         estado_final_simulacao = None
-
+        # ... (Loop app.stream como na versão anterior) ...
         try:
             for s in app.stream(input=estado_inicial, config={"recursion_limit": max_passos_simulacao}):
                 passo_atual_simulacao += 1
-                progress_value = int((passo_atual_simulacao / max_passos_simulacao) * 100)
+                num_total_etapas_estimadas = len(mapa_tarefa_no_atual) + 1
+                progress_value = min(100, int((passo_atual_simulacao / num_total_etapas_estimadas) * 100))
                 progress_bar.progress(progress_value)
 
                 if not isinstance(s, dict) or not s:
-                    log_area.error(f"[Main - Passo {passo_atual_simulacao}] Stream retornou valor inesperado: {s}. Encerrando.")
-                    print(f"[Main - Passo {passo_atual_simulacao}] Stream retornou valor inesperado: {s}. Encerrando.")
+                    msg = f"Erro: Stream retornou valor inesperado: {s}. Encerrando."
+                    steps_container.error(msg)
                     break
 
                 nome_do_no_executado = list(s.keys())[0]
                 estado_parcial_apos_no = s[nome_do_no_executado]
                 estado_final_simulacao = estado_parcial_apos_no
 
-                log_area.info(f"[Main - Passo {passo_atual_simulacao}] Nó executado: '{nome_do_no_executado}'")
-                print(f"\n[Main - Passo {passo_atual_simulacao}] Nó executado: '{nome_do_no_executado}'")
-                if estado_parcial_apos_no:
-                    etapa_concluida_log = estado_parcial_apos_no.get('etapa_concluida_pelo_ultimo_no', 'N/A')
-                    doc_gerado_log = str(estado_parcial_apos_no.get('documento_gerado_na_etapa_recente', ''))[:200]
-                    prox_ator_sug_log = estado_parcial_apos_no.get('proximo_ator_sugerido_pelo_ultimo_no', 'N/A')
-
-                    log_area.info(f"  Etapa Concluída por '{nome_do_no_executado}': {etapa_concluida_log}")
-                    log_area.info(f"  Documento Gerado (trecho): {doc_gerado_log}...")
-                    log_area.info(f"  Próximo Ator Sugerido: {prox_ator_sug_log}")
-                    print(f"  Etapa Concluída por '{nome_do_no_executado}': {etapa_concluida_log}")
-                    print(f"  Documento Gerado (trecho): {doc_gerado_log}...")
-                    print(f"  Próximo Ator Sugerido: {prox_ator_sug_log}")
-
-                    historico_str = "### Histórico da Simulação:\n"
-                    for i, item_hist in enumerate(estado_parcial_apos_no.get("historico_completo", [])):
-                        ator_hist = item_hist.get('ator', 'N/A')
-                        etapa_hist = item_hist.get('etapa', 'N/A')
-                        doc_hist = str(item_hist.get('documento', 'N/A'))[:100] + "..."
-                        historico_str += f"{i+1}. **Ator:** {ator_hist}, **Etapa:** {etapa_hist}\n   **Documento:** {doc_hist}\n"
-                    historico_area.markdown(historico_str)
-
-                else:
-                    log_area.warning(" AVISO: Estado parcial após nó está vazio ou None.")
-                    print("  AVISO: Estado parcial após nó está vazio ou None.")
-
+                etapa_concluida_log = estado_parcial_apos_no.get('etapa_concluida_pelo_ultimo_no', 'N/A')
+                doc_gerado_completo = str(estado_parcial_apos_no.get('documento_gerado_na_etapa_recente', ''))
+                prox_ator_sug_log = estado_parcial_apos_no.get('proximo_ator_sugerido_pelo_ultimo_no', 'N/A')
+                
+                expander_title = f"Passo {passo_atual_simulacao}: {nome_do_no_executado} concluiu '{etapa_concluida_log}'"
                 if nome_do_no_executado == END:
-                    log_area.success("\n[Main] Fluxo da simulação atingiu o nó FINAL (END).")
-                    print("\n[Main] Fluxo da simulação atingiu o nó FINAL (END).")
+                     expander_title = f"Passo {passo_atual_simulacao}: Fim da Simulação"
+                
+                with steps_container.expander(expander_title, expanded=st.session_state.expand_all_steps):
+                    st.markdown(f"**Nó Executado:** `{nome_do_no_executado}`")
+                    st.markdown(f"**Etapa Concluída:** `{etapa_concluida_log}`")
+                    if etapa_concluida_log != "ERRO_FLUXO_IRRECUPERAVEL" and doc_gerado_completo:
+                        st.text_area("Documento Gerado:", value=doc_gerado_completo, height=200, key=f"doc_step_{passo_atual_simulacao}", disabled=True)
+                    elif doc_gerado_completo:
+                        st.error(f"Detalhe do Erro/Documento: {doc_gerado_completo}")
+                    st.markdown(f"**Próximo Ator Sugerido:** `{prox_ator_sug_log}`")
+
+                if nome_do_no_executado == END or prox_ator_sug_log == ETAPA_FIM_PROCESSO:
+                    steps_container.success("Fluxo da simulação atingiu o nó FINAL ou etapa de fim.")
+                    progress_bar.progress(100)
                     break
                 if passo_atual_simulacao >= max_passos_simulacao:
-                    log_area.warning(f"\n[Main] Simulação atingiu o limite máximo de {max_passos_simulacao} passos.")
-                    print(f"\n[Main] Simulação atingiu o limite máximo de {max_passos_simulacao} passos.")
+                    steps_container.warning(f"Simulação atingiu o limite máximo de {max_passos_simulacao} passos.")
                     break
-
         except Exception as e:
-            log_area.error(f"\n[Main] ERRO INESPERADO DURANTE A EXECUÇÃO DA SIMULAÇÃO: {e}")
-            print(f"\n[Main] ERRO INESPERADO DURANTE A EXECUÇÃO DA SIMULAÇÃO:")
+            st.error(f"ERRO INESPERADO DURANTE A EXECUÇÃO DA SIMULAÇÃO: {e}")
             import traceback
-            traceback.print_exc()
-            print(f"Erro: {e}")
-            if estado_final_simulacao:
-                log_area.info("\n[Main] Último estado conhecido antes do erro:")
-                print("\n[Main] Último estado conhecido antes do erro:")
-                for key, value in estado_final_simulacao.items():
-                    if key == "retriever":
-                        log_area.info(f"  {key}: <Instância do Retriever>")
-                        print(f"  {key}: <Instância do Retriever>")
-                    elif key == "historico_completo":
-                        log_area.info(f"  {key}: ({len(value)} itens no histórico)")
-                        print(f"  {key}: ({len(value)} itens no histórico)")
-                    else:
-                        log_area.info(f"  {key}: {str(value)[:300]}")
-                        print(f"  {key}: {str(value)[:300]}")
-
+            st.text_area("Stack Trace do Erro:", traceback.format_exc(), height=300)
         finally:
-            if 'nome_arquivo_temporario' in locals() and os.path.exists(nome_arquivo_temporario):
-                os.remove(nome_arquivo_temporario)
-                print(f"[Main] Arquivo temporário '{nome_arquivo_temporario}' removido.")
-            elif 'nome_arquivo_temporario' not in locals():
-                print("[Main] Nenhum arquivo temporário para remover.")
-            elif not os.path.exists(nome_arquivo_temporario):
-                print(f"[Main] Arquivo temporário '{nome_arquivo_temporario}' já foi removido ou não existe.")
+            if os.path.exists(caminho_temp_salvo):
+                os.remove(caminho_temp_salvo)
+                print(f"[Main] Arquivo temporário '{caminho_temp_salvo}' removido.")
+            progress_bar.empty()
 
-        st.subheader("Fim da Simulação Jurídica")
+        st.markdown("---")
+        st.subheader("Linha do Tempo Interativa do Processo")
+
         if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
-            historico_str_final = "### Histórico Completo de Ações e Documentos Gerados:\n"
-            for i, item_hist in enumerate(estado_final_simulacao["historico_completo"]):
-                ator_hist = item_hist.get('ator', 'N/A')
-                etapa_hist = item_hist.get('etapa', 'N/A')
-                doc_hist = str(item_hist.get('documento', 'N/A'))[:200] + "..."
-                historico_str_final += f"{i+1}. **Ator:** {ator_hist}, **Etapa:** {etapa_hist}\n   **Documento:** {doc_hist}\n"
-            st.markdown(historico_str_final)
-            print("\n\n--- FIM DA SIMULAÇÃO JURÍDICA ---")
-            print("\nHistórico Completo de Ações e Documentos Gerados:")
-            for i, item_hist in enumerate(estado_final_simulacao["historico_completo"]):
-                ator_hist = item_hist.get('ator', 'N/A')
-                etapa_hist = item_hist.get('etapa', 'N/A')
-                doc_hist = str(item_hist.get('documento', 'N/A'))[:200] + "..."
-                print(f"  {i+1}. Ator: {ator_hist}, Etapa: {etapa_hist}\n    Documento (trecho): {doc_hist}...")
-        else:
-            st.warning("Nenhum histórico completo disponível ou simulação não produziu estado final válido.")
-            print("Nenhum histórico completo disponível ou simulação não produziu estado final válido.")
+            historico = estado_final_simulacao["historico_completo"]
+            
+            # Mapeamento de ícones (Unicode emojis)
+            icon_map = {
+                ADVOGADO_AUTOR: "🙋‍♂️", # Pessoa levantando a mão (autor)
+                JUIZ: "⚖️",          # Balança da justiça
+                ADVOGADO_REU: "🙋‍♀️", # Pessoa levantando a mão (réu - outra figura)
+                ETAPA_PETICAO_INICIAL: "📄",
+                ETAPA_DESPACHO_RECEBENDO_INICIAL: "➡️",
+                ETAPA_CONTESTACAO: " دفاع ", # Defesa em árabe (exemplo visual) ou "🛡️",
+                ETAPA_DECISAO_SANEAMENTO: "🛠️",
+                ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR: "🗣️",
+                ETAPA_MANIFESTACAO_SEM_PROVAS_REU: "🗣️",
+                ETAPA_SENTENCA: "🏁",
+                "DEFAULT_ACTOR": "👤",
+                "DEFAULT_ETAPA": "📑"
+            }
 
-        print("\n[Main] Execução concluída.")
+            # Criar colunas para a linha do tempo. O número de colunas é o número de etapas.
+            # Se for muito grande, o Streamlit vai empilhar.
+            # Para um visual mais controlado, poderíamos limitar o número de itens por linha
+            # ou usar um container com overflow CSS (mais complexo).
+            # Por simplicidade, vamos usar colunas diretas.
+            
+            num_etapas = len(historico)
+            cols = st.columns(num_etapas)
+
+            for i, item_hist in enumerate(historico):
+                ator_hist = item_hist.get('ator', 'N/A')
+                etapa_hist = item_hist.get('etapa', 'N/A')
+                doc_completo_hist = str(item_hist.get('documento', 'N/A'))
+                
+                ator_icon = icon_map.get(ator_hist, icon_map["DEFAULT_ACTOR"])
+                etapa_icon = icon_map.get(etapa_hist, icon_map["DEFAULT_ETAPA"])
+
+                with cols[i]:
+                    # Exibir o ícone do ator e da etapa de forma proeminente
+                    st.markdown(f"<div style='text-align: center; font-size: 24px;'>{ator_icon}{etapa_icon}</div>", unsafe_allow_html=True)
+                    # Nome do ator e etapa abaixo dos ícones
+                    st.markdown(f"<p style='text-align: center; font-size: 12px; margin-bottom: 5px;'><b>{ator_hist}</b><br>{etapa_hist}</p>", unsafe_allow_html=True)
+                    
+                    # Botão para ver o documento
+                    if st.button(f"Doc {i+1}", key=f"btn_timeline_{i}", help=f"Ver documento: {ator_hist} - {etapa_hist}"):
+                        st.session_state.doc_visualizado = doc_completo_hist
+                        st.session_state.doc_visualizado_titulo = f"Documento (Etapa {i+1} da Linha do Tempo): {ator_hist} - {etapa_hist}"
+                        # st.rerun() # Geralmente não necessário se o placeholder estiver fora do loop de colunas
+
+                # Adicionar uma "seta" ou conector entre as colunas, exceto para a última
+                # Isso é difícil de fazer de forma robusta com st.columns diretamente.
+                # Poderíamos tentar com st.markdown entre as colunas, mas o alinhamento é complexo.
+                # Para esta versão, omitiremos as setas conectoras complexas entre colunas.
+                # Uma linha simples abaixo da "faixa" da timeline pode ser uma opção.
+            
+            if num_etapas > 0:
+                 st.markdown("---") # Linha separadora após a timeline
+
+        else:
+            st.warning("Nenhum histórico completo disponível para exibir na linha do tempo.")
+
+        # Exibição do documento completo selecionado (fora do loop do histórico)
+        # Este placeholder é crucial e deve estar FORA de qualquer loop de colunas ou expanders.
+        if st.session_state.doc_visualizado:
+            with doc_completo_placeholder.container():
+                st.subheader(st.session_state.doc_visualizado_titulo)
+                st.text_area("Conteúdo do Documento:", st.session_state.doc_visualizado, height=400, key="doc_view_timeline_area")
+                if st.button("Fechar Visualização do Documento", key="close_doc_view_timeline_btn"):
+                    st.session_state.doc_visualizado = None
+                    st.session_state.doc_visualizado_titulo = ""
+                    st.rerun()
+        
+        st.markdown("---")
+        # Manter a seção de Histórico Detalhado com expanders se ainda for útil
+        st.subheader("Histórico Detalhado (Conteúdo das Etapas):")
+        # (O código dos expanders do histórico detalhado pode permanecer aqui, como antes)
+        if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
+            if st.button("Alternar Expansão dos Itens do Histórico Detalhado"):
+                st.session_state.expand_all_history = not st.session_state.expand_all_history
+            for i, item_hist in enumerate(estado_final_simulacao["historico_completo"]):
+                ator_hist = item_hist.get('ator', 'N/A')
+                etapa_hist = item_hist.get('etapa', 'N/A')
+                doc_completo_hist = str(item_hist.get('documento', 'N/A'))
+                with st.expander(f"{i+1}. Ator: {ator_hist} | Etapa: {etapa_hist}", expanded=st.session_state.expand_all_history):
+                    # ... (conteúdo do expander como antes, mas o botão de ver documento aqui pode ser removido se a timeline for suficiente)
+                    st.text_area(f"Documento Gerado (Detalhe {i+1}):", value=doc_completo_hist, height=150, key=f"doc_hist_detail_{i}", disabled=True)
+
+        st.markdown("--- FIM DA SIMULAÇÃO ---")
+        print("\n[Main] Execução da simulação Streamlit concluída.")
+
+    else:
+        st.info("Aguardando upload do arquivo do processo para iniciar a simulação.")
