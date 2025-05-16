@@ -5,7 +5,7 @@ import shutil # Para limpar a pasta FAISS se necessário
 import time # Para ID único de processo
 from dotenv import load_dotenv
 from typing import TypedDict, List, Union, Dict, Tuple, Any
-import json
+
 
 # LangChain & LangGraph
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -15,7 +15,11 @@ from langchain_community.vectorstores import FAISS
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document # Adicionado
+from langchain_core.documents import Document
+from langchain_google_community import GoogleSearchAPIWrapper
+from langchain_google_community.search import GoogleSearchRun
+from langchain_core.tools import Tool
+
 
 
 import streamlit as st
@@ -31,6 +35,11 @@ if not GOOGLE_API_KEY:
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
 os.environ["LANGCHAIN_PROJECT"] = "SimulacaoJuridicaDebug"
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+GOOGLE_API_KEY_SEARCH = os.getenv("GOOGLE_API_KEY_SEARCH")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
 # --- 1. Constantes e Configurações Globais ---
 DATA_PATH = "simulacao_juridica_data"
@@ -206,8 +215,11 @@ class EstadoProcessual(TypedDict):
     dados_formulario_entrada: Union[Dict[str, Any], None]
 
     # Para armazenar documentos juntados pelo Réu após a contestação
-    documentos_juntados_pelo_reu: Union[List[Dict[str, str]], None] 
+    documentos_juntados_pelo_reu: Union[List[Dict[str, str]], None]
 
+    # CAMPOS PARA ANÁLISE DE SENTIMENTO
+    sentimento_peticao_inicial: Union[str, None]
+    sentimento_contestacao: Union[str, None]
 
 # --- 5. Mapa de Fluxo Processual (Rito Ordinário) ---
 mapa_tarefa_no_atual: Dict[Tuple[Union[str, None], Union[str, None], str], str] = {
@@ -346,6 +358,24 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado # Mantido para outros contextos, menos relevante para PI
         })
+        # ---> INÍCIO: Análise de Sentimento da Petição Inicial <---
+        sentimento_pi_texto = "Não analisado"
+        try:
+            prompt_sentimento_pi = f"""
+            Analise o tom e o sentimento predominante do seguinte texto jurídico (Petição Inicial).
+            Responda com uma única palavra ou expressão curta que melhor descreva o sentimento (ex: Assertivo, Conciliatório, Agressivo, Neutro, Persuasivo, Formal, Emocional, Confiante, Defensivo, Indignado, Colaborativo).
+            Seja conciso.
+
+            Texto da Petição Inicial:
+            {documento_gerado[:3000]} # Limita para evitar estouro de token, se necessário
+
+            Sentimento Predominante:"""
+            chain_sentimento_pi = criar_prompt_e_chain(prompt_sentimento_pi)
+            sentimento_pi_texto = chain_sentimento_pi.invoke({}) # documento_gerado está no prompt
+            print(f"[{ADVOGADO_AUTOR}-{etapa_atual_do_no}] Sentimento da PI: {sentimento_pi_texto}")
+        except Exception as e_sent:
+            print(f"Erro ao analisar sentimento da PI: {e_sent}")
+            sentimento_pi_texto = "Erro na análise"
         proximo_ator_logico = JUIZ
 
     elif etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR:
@@ -403,6 +433,7 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
         "historico_completo": historico_atualizado,
         "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR),
         "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
+        "sentimento_peticao_inicial": sentimento_pi_texto if etapa_atual_do_no == ETAPA_PETICAO_INICIAL else estado.get("sentimento_peticao_inicial"),
     }
     # Preserva outros campos do estado que não foram explicitamente modificados
     estado_final_retorno = {**estado, **estado_retorno_parcial}
@@ -763,6 +794,25 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
         # Anexar a lista de documentos ao final da contestação (opcional, para o histórico)
         documentos_reu_texto_para_anexar = formatar_lista_documentos_para_prompt(lista_documentos_juntados_pelo_reu_final, "Réu")
         documento_gerado_principal += f"\n\n---\n{documentos_reu_texto_para_anexar}"
+        
+        # ---> INÍCIO: Análise de Sentimento da Contestação <---
+        sentimento_contestacao_texto = "Não analisado"
+        try:
+            prompt_sentimento_contestacao = f"""
+            Analise o tom e o sentimento predominante do seguinte texto jurídico (Contestação).
+            Responda com uma única palavra ou expressão curta que melhor descreva o sentimento (ex: Assertivo, Conciliatório, Agressivo, Neutro, Persuasivo, Formal, Emocional, Confiante, Defensivo, Indignado, Colaborativo).
+            Seja conciso.
+
+            Texto da Contestação:
+            {documento_gerado_principal[:3000]} # Limita para evitar estouro de token
+
+            Sentimento Predominante:"""
+            chain_sentimento_contestacao = criar_prompt_e_chain(prompt_sentimento_contestacao)
+            sentimento_contestacao_texto = chain_sentimento_contestacao.invoke({}) # documento_gerado_principal está no prompt
+            print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Sentimento da Contestação: {sentimento_contestacao_texto}")
+        except Exception as e_sent:
+            print(f"Erro ao analisar sentimento da Contestação: {e_sent}")
+            sentimento_contestacao_texto = "Erro na análise"
         proximo_ator_logico = JUIZ
 
 
@@ -834,7 +884,8 @@ def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
         "historico_completo": historico_atualizado,
         "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_REU),
         "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
-        "documentos_juntados_pelo_reu": lista_documentos_juntados_pelo_reu_final # Salva a lista estruturada no estado
+        "documentos_juntados_pelo_reu": lista_documentos_juntados_pelo_reu_final, # Salva a lista estruturada no estado
+        "sentimento_contestacao": sentimento_contestacao_texto if etapa_atual_do_no == ETAPA_CONTESTACAO else estado.get("sentimento_contestacao"),
     }
     estado_final_retorno = {**estado, **estado_retorno_parcial}
     return estado_final_retorno
@@ -850,6 +901,176 @@ workflow.add_conditional_edges(ADVOGADO_AUTOR, decidir_proximo_no_do_grafo, rote
 workflow.add_conditional_edges(JUIZ, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
 workflow.add_conditional_edges(ADVOGADO_REU, decidir_proximo_no_do_grafo, roteamento_mapa_edges)
 app = workflow.compile()
+
+
+# --- 8-A. Funcionalidades Adicionais (Ementa, Sentimentos, Verificador) ---
+
+def gerar_ementa_cnj_padrao(texto_sentenca: str, id_processo: str, llm_usado: ChatGoogleGenerativeAI) -> str:
+    """
+    Gera uma ementa para a sentença fornecida, seguindo o padrão da Recomendação CNJ 154/2024.
+    """
+    prompt_template_ementa = """
+    Você é um especialista em direito e Diretor de Secretaria experiente, encarregado de gerar uma ementa para a seguinte sentença, seguindo RIGOROSAMENTE o padrão da Recomendação CNJ 154/2024 (EMENTA-PADRÃO).
+
+    **SENTENÇA COMPLETA:**
+    {texto_sentenca}
+
+    **PADRÃO DA EMENTA (Recomendação CNJ 154/2024) A SER SEGUIDO:**
+    Ementa: [Ramo do Direito]. [Classe processual]. [Frase ou palavras que indiquem o assunto principal]. [Conclusão].
+
+    I. Caso em exame
+    1. Apresentação do caso, com a indicação dos fatos relevantes, do pedido principal da ação ou do recurso e, se for o caso, da decisão recorrida.
+
+    II. Questão em discussão
+    2. A questão em discussão consiste em (...). / Há duas questões em discussão: (i) saber se (...); e (ii) saber se (...). (incluir todas as questões, com os seus respectivos fatos e fundamentos, utilizando-se de numeração em romano, letras minúsculas e entre parênteses).
+
+    III. Razões de decidir
+    3. Exposição do fundamento de maneira resumida (cada fundamento deve integrar um item).
+    4. Exposição de outro fundamento de maneira resumida. (Adicionar mais itens conforme necessário, seguindo a numeração)
+
+    IV. Dispositivo e tese
+    5. Ex: Pedido procedente/improcedente. Recurso provido/desprovido.
+    Tese de julgamento: frases objetivas das conclusões da decisão, ordenadas por numerais cardinais entre aspas e sem itálico. “1. [texto da tese]. 2. [texto da tese]” (quando houver tese).
+    _________
+    Dispositivos relevantes citados: ex.: CF/1988, art. 1º, III e IV; CC, arts. 1.641, II, e 1.639, § 2º.
+    Jurisprudência relevante citada: ex.: STF, ADPF nº 130, Rel. Min. Ayres Britto, Plenário, j. 30.04.2009.
+
+    **INSTRUÇÕES CRÍTICAS:**
+    - Extraia as informações DIRETAMENTE da sentença fornecida. NÃO INVENTE informações.
+    - Preencha TODAS as seções do padrão da ementa conforme especificado.
+    - Seja fiel ao conteúdo e à terminologia da sentença.
+    - Para "Ramo do Direito" e "Classe Processual", infira da sentença ou, se não explícito, deduza com base no conteúdo (ex: Direito Civil, Ação de Indenização por Danos Morais).
+    - Mantenha a formatação EXATA, incluindo numeração, marcadores (I, II, III, IV), letras minúsculas entre parênteses para sub-itens de questões, e a linha "_________" antes dos dispositivos/jurisprudência citados.
+    - Se uma seção não tiver conteúdo direto na sentença (ex: ausência de tese explícita), indique "Não consta expressamente na sentença." ou similar, mas tente ao máximo extrair ou inferir.
+
+    Responda APENAS com a ementa formatada.
+
+    **EMENTA GERADA (no padrão CNJ):**
+    """
+    chain_ementa = criar_prompt_e_chain(prompt_template_ementa) # Reutiliza sua função existente
+    try:
+        ementa_gerada = chain_ementa.invoke({
+            "texto_sentenca": texto_sentenca,
+            # "id_processo": id_processo # Pode ser útil para o LLM ter o ID, mas não é estritamente parte do template CNJ
+        })
+        return ementa_gerada
+    except Exception as e:
+        print(f"Erro ao gerar ementa CNJ: {e}")
+        return f"Erro ao gerar ementa: {e}"
+
+search_tool = None
+if GOOGLE_API_KEY_SEARCH and GOOGLE_CSE_ID:
+    try:
+        # 1. Crie a instância do API Wrapper
+        search_api_wrapper_instance = GoogleSearchAPIWrapper(
+            google_api_key=GOOGLE_API_KEY_SEARCH,
+            google_cse_id=GOOGLE_CSE_ID
+        )
+
+        # 2. Crie a instância da ferramenta GoogleSearchRun,
+        #    passando o wrapper, e atribua à sua variável
+        search_tool = GoogleSearchRun( # Esta é a CLASSE GoogleSearchRun
+            api_wrapper=search_api_wrapper_instance
+            # Você pode adicionar outros parâmetros opcionais aqui, como 'description'
+        )
+        print("[INFO] Ferramenta Google Search_tool (instância de GoogleSearchRun) configurada com sucesso.")
+
+    except Exception as e_config_tool:
+        import traceback
+        print(f"[AVISO] Falha ao configurar search_tool: {e_config_tool}")
+        print(traceback.format_exc())
+        search_tool = None
+else:
+    print("[AVISO] Chaves de API para busca não definidas. Ferramenta search_tool desabilitada.")
+
+# Para usar a ferramenta:
+if search_tool:
+    try:
+        resultados = search_tool.invoke("sua query de busca")
+        print(resultados)
+    except Exception as e_invoke_tool:
+        print(f"Erro ao invocar a ferramenta search_tool: {e_invoke_tool}")
+
+def verificar_sentenca_com_jurisprudencia(texto_sentenca: str, llm_usado: ChatGoogleGenerativeAI) -> str:
+    """
+    Verifica a sentença comparando-a com jurisprudência encontrada via Google Search.
+    """
+    if not search_tool:
+        return "Ferramenta de busca Google não está configurada ou disponível. Verifique as chaves GOOGLE_API_KEY_SEARCH e GOOGLE_CSE_ID."
+
+    # 1. Extrair teses/palavras-chave da sentença para busca
+    prompt_extracao_teses = f"""
+    Dada a seguinte sentença, extraia 2-3 teses jurídicas centrais ou os principais pontos de direito decididos.
+    Formate cada tese como uma frase curta e objetiva, ideal para uma busca de jurisprudência.
+    Se a sentença for complexa, foque nos pontos que seriam mais controversos ou relevantes para pesquisa jurisprudencial.
+    Responda com cada tese em uma nova linha.
+
+    Sentença (trecho inicial para identificação, o conteúdo completo foi analisado internamente):
+    {texto_sentenca[:1500]}
+
+    Teses/Palavras-chave para Busca (uma por linha):
+    """
+    chain_extracao = criar_prompt_e_chain(prompt_extracao_teses)
+    try:
+        teses_str = chain_extracao.invoke({"texto_sentenca": texto_sentenca}) # Passa o texto completo aqui
+        teses_para_busca = [t.strip() for t in teses_str.split('\n') if t.strip()]
+        if not teses_para_busca:
+            return "Não foi possível extrair teses da sentença para a busca."
+        print(f"Teses extraídas para busca: {teses_para_busca}")
+    except Exception as e:
+        return f"Erro ao extrair teses da sentença: {e}"
+
+    # 2. Buscar jurisprudência para cada tese
+    todos_resultados_busca = []
+    with st.spinner(f"Buscando jurisprudência para {len(teses_para_busca)} tese(s)..."):
+        for i, tese in enumerate(teses_para_busca):
+            if not tese: continue
+            st.write(f"Buscando por: '{tese}'...")
+            try:
+                # Adicionar termos como "jurisprudência", "acórdão" pode refinar a busca
+                query_busca = f'jurisprudência {tese}' #  OR ementa {tese}
+                resultados_tese_str = search_tool.invoke(query_busca)
+                todos_resultados_busca.append(f"Resultados da busca para '{tese}':\n{resultados_tese_str}\n---\n")
+                st.write(f"Resultados parciais para '{tese}' obtidos.")
+            except Exception as e_busca:
+                todos_resultados_busca.append(f"Erro ao buscar por '{tese}': {e_busca}\n---\n")
+                st.warning(f"Erro na busca por '{tese}': {e_busca}")
+        st.success("Busca de jurisprudência concluída.")
+
+    snippets_jurisprudencia_formatados = "\n".join(todos_resultados_busca)
+    if not snippets_jurisprudencia_formatados.strip():
+        snippets_jurisprudencia_formatados = "Nenhum resultado encontrado nas buscas."
+
+    # 3. Análise comparativa pelo LLM
+    prompt_analise_sentenca = f"""
+    Você é um jurista sênior analisando uma sentença judicial à luz da jurisprudência encontrada.
+
+    **SENTENÇA ORIGINAL (Trechos mais relevantes ou resumo):**
+    (Considere os seguintes pontos principais da sentença que foi proferida no caso simulado)
+    {teses_str}
+    (Fim dos trechos da sentença)
+
+    **JURISPRUDÊNCIA ENCONTRADA (Snippets e Resumos de Buscas):**
+    {snippets_jurisprudencia_formatados}
+
+    **Tarefa:**
+    Com base EXCLUSIVAMENTE na jurisprudência fornecida acima, avalie se as teses principais da sentença original parecem estar, em termos gerais, alinhadas ou desalinhadas com essa jurisprudência.
+    Seja cauteloso e objetivo. Se a jurisprudência não for clara, suficiente ou diretamente aplicável, afirme isso.
+
+    **Formato da Resposta:**
+    1.  **Avaliação Geral:** (Ex: "Alinhada com a jurisprudência apresentada.", "Aparentemente desalinhada em relação a X.", "Parcialmente alinhada.", "Jurisprudência insuficiente para uma conclusão definitiva.")
+    2.  **Justificativa Sucinta:** (Explique brevemente, apontando pontos de convergência ou divergência com base nos trechos da jurisprudência, ou a dificuldade de comparação.)
+    3.  **Observação:** Lembre-se que esta é uma análise preliminar baseada em snippets de busca.
+
+    **Análise da Sentença vs. Jurisprudência:**
+    """
+    chain_analise_final = criar_prompt_e_chain(prompt_analise_sentenca)
+    try:
+        analise_final = chain_analise_final.invoke({}) # Contexto já está no prompt
+        return analise_final
+    except Exception as e:
+        return f"Erro ao realizar análise comparativa da sentença: {e}"
+
 
 # --- 9. Interface Streamlit e Lógica de Execução ---
 
@@ -936,6 +1157,16 @@ def inicializar_estado_formulario():
         st.session_state.doc_visualizado = None
     if 'doc_visualizado_titulo' not in st.session_state:
         st.session_state.doc_visualizado_titulo = ""
+
+    # NOVOS ESTADOS DA UI PARA FUNCIONALIDADES ADICIONAIS
+    if 'ementa_cnj_gerada' not in st.session_state:
+        st.session_state.ementa_cnj_gerada = None
+    if 'verificacao_sentenca_resultado' not in st.session_state:
+        st.session_state.verificacao_sentenca_resultado = None
+    if 'show_ementa_popup' not in st.session_state: # Para controlar popup/modal
+        st.session_state.show_ementa_popup = False
+    if 'show_verificacao_popup' not in st.session_state:
+        st.session_state.show_verificacao_popup = False
 
 def gerar_conteudo_com_ia(prompt_template_str: str, campos_prompt: dict, campo_formulario_display: str, chave_estado: str, sub_chave_lista: Union[str, int, None] = None, indice_lista: Union[int, None] = None):
     """
@@ -1540,7 +1771,159 @@ Dos Pedidos:
 
 # --- Função exibir_resultados_simulacao (sem grandes mudanças estruturais aqui, mas pode exibir docs do réu) ---
 def exibir_resultados_simulacao(estado_final_simulacao: dict):
-    st.markdown("---")
+    # Definição do mapa de cores para sentimentos (pode ser global ou dentro da função de UI)
+    SENTIMENTO_CORES = {
+        "Assertivo": "lightblue", "Confiante": "lightgreen", "Persuasivo": "lightyellow",
+        "Combativo": "lightcoral", "Agressivo": "salmon", "Indignado": "lightpink",
+        "Neutro": "lightgray", "Formal": "whitesmoke",
+        "Conciliatório": "palegreen", "Colaborativo": "mediumaquamarine",
+        "Defensivo": "thistle", "Emocional": "lavenderblush",
+        "Não analisado": "silver", "Erro na análise": "orangered"
+    }
+    DEFAULT_SENTIMENTO_COR = "gainsboro"
+
+    doc_completo_placeholder_sim = st.empty() # Para visualização de docs da timeline
+
+    if estado_final_simulacao:
+        sentimento_pi = estado_final_simulacao.get("sentimento_peticao_inicial")
+        sentimento_cont = estado_final_simulacao.get("sentimento_contestacao")
+        
+        if sentimento_pi or sentimento_cont:
+            st.markdown("#### Análise de Sentimentos (IA)")
+            cols_sent = st.columns(2)
+            if sentimento_pi:
+                cor_pi = SENTIMENTO_CORES.get(sentimento_pi, DEFAULT_SENTIMENTO_COR)
+                cols_sent[0].markdown(f"**Petição Inicial:** <span style='background-color:{cor_pi}; color:black; padding: 3px 6px; border-radius: 5px;'>{sentimento_pi}</span>", unsafe_allow_html=True)
+            else:
+                cols_sent[0].markdown("**Petição Inicial:** Sentimento não analisado.")
+            if sentimento_cont:
+                cor_cont = SENTIMENTO_CORES.get(sentimento_cont, DEFAULT_SENTIMENTO_COR)
+                cols_sent[1].markdown(f"**Contestação:** <span style='background-color:{cor_cont}; color:black; padding: 3px 6px; border-radius: 5px;'>{sentimento_cont}</span>", unsafe_allow_html=True)
+            else:
+                cols_sent[1].markdown("**Contestação:** Sentimento não analisado.")
+            st.markdown("---") # Separador após a análise de sentimentos
+
+    # Linha do Tempo Interativa do Processo
+    if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
+        st.markdown("#### Linha do Tempo Interativa do Processo")
+        historico = estado_final_simulacao["historico_completo"]
+        icon_map = { # Seu icon_map ...
+            ADVOGADO_AUTOR: "🙋‍♂️", JUIZ: "⚖️", ADVOGADO_REU: "🙋‍♀️",
+            ETAPA_PETICAO_INICIAL: "📄", ETAPA_DESPACHO_RECEBENDO_INICIAL: "➡️",
+            ETAPA_CONTESTACAO: "🛡️", ETAPA_DECISAO_SANEAMENTO: "🛠️",
+            ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR: "🗣️", ETAPA_MANIFESTACAO_SEM_PROVAS_REU: "🗣️",
+            ETAPA_SENTENCA: "🏁", "DEFAULT_ACTOR": "👤", "DEFAULT_ETAPA": "📑",
+            "ERRO_FLUXO_IRRECUPERAVEL": "❌", "ERRO_ETAPA_NAO_ENCONTRADA": "❓"
+        }
+        num_etapas = len(historico)
+        if num_etapas > 0 :
+            cols = st.columns(min(num_etapas, 8))
+            for i, item_hist in enumerate(historico):
+                ator_hist = item_hist.get('ator', 'N/A')
+                etapa_hist = item_hist.get('etapa', 'N/A')
+                doc_completo_hist = str(item_hist.get('documento', 'N/A'))
+                
+                ator_icon = icon_map.get(ator_hist, icon_map["DEFAULT_ACTOR"])
+                etapa_icon = icon_map.get(etapa_hist, icon_map["DEFAULT_ETAPA"])
+                cor_fundo = "rgba(255, 0, 0, 0.1)" if "ERRO" in etapa_hist else "rgba(0, 0, 0, 0.03)"
+
+                with cols[i % len(cols)]:
+                    container_style = f"border: 1px solid #ddd; border-radius: 5px; padding: 10px; text-align: center; background-color: {cor_fundo}; height: 130px; display: flex; flex-direction: column; justify-content: space-around; margin-bottom: 5px;"
+                    st.markdown(f"<div style='{container_style}'>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size: 28px;'>{ator_icon}{etapa_icon}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size: 11px; margin-bottom: 3px;'><b>{ator_hist}</b><br>{etapa_hist[:30]}{'...' if len(etapa_hist)>30 else ''}</div>", unsafe_allow_html=True)
+                    if st.button(f"Ver Doc {i+1}", key=f"btn_timeline_sim_{i}_final", help=f"Visualizar: {etapa_hist}", use_container_width=True):
+                        st.session_state.doc_visualizado = doc_completo_hist
+                        st.session_state.doc_visualizado_titulo = f"Documento da Linha do Tempo (Passo {i+1}): {ator_hist} - {etapa_hist}"
+                        # doc_completo_placeholder_sim.empty() # Limpa antes de re-exibir o placeholder
+                        st.rerun() 
+                    st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("<hr>", unsafe_allow_html=True) 
+    else:
+        st.warning("Nenhum histórico completo para exibir na linha do tempo.")
+
+    # Visualização do Documento da Timeline (quando st.session_state.doc_visualizado é setado)
+    if st.session_state.get('doc_visualizado') is not None: 
+        with doc_completo_placeholder_sim.container(): # Usar o placeholder definido no início da função
+            st.subheader(st.session_state.get('doc_visualizado_titulo', "Visualização de Documento"))
+            st.text_area("Conteúdo do Documento:", st.session_state.doc_visualizado, height=350, key="doc_view_sim_area_main_results_final", disabled=True)
+            if st.button("Fechar Visualização do Documento", key="close_doc_view_sim_btn_main_results_final", type="primary"):
+                st.session_state.doc_visualizado = None
+                st.session_state.doc_visualizado_titulo = ""
+                doc_completo_placeholder_sim.empty() # Limpa o conteúdo do placeholder
+                st.rerun()
+
+    # Funcionalidades Adicionais da Sentença (Ementa e Verificação)
+    sentenca_texto_completo = None
+    houve_sentenca = False
+    if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
+        for item_hist in reversed(estado_final_simulacao["historico_completo"]):
+            if item_hist.get("etapa") == ETAPA_SENTENCA:
+                sentenca_texto_completo = str(item_hist.get("documento", ""))
+                houve_sentenca = True
+                break
+    
+    if houve_sentenca and sentenca_texto_completo:
+        st.markdown("---")
+        st.markdown("#### Funcionalidades Adicionais da Sentença")
+        id_proc = estado_final_simulacao.get("id_processo", "desconhecido")
+
+        col_ementa, col_verificador = st.columns(2)
+
+        with col_ementa:
+            if st.button("📄 Gerar Ementa (Padrão CNJ)", key="btn_gerar_ementa_final", use_container_width=True):
+                # ... (lógica do botão como você tem)
+                if sentenca_texto_completo:
+                    with st.spinner("Gerando ementa no padrão CNJ... Isso pode levar um momento."):
+                        st.session_state.ementa_cnj_gerada = gerar_ementa_cnj_padrao(sentenca_texto_completo, id_proc, llm)
+                        st.session_state.show_ementa_popup = True
+                        st.rerun()
+                else:
+                    st.warning("Texto da sentença não encontrado para gerar ementa.")
+        
+        with col_verificador:
+            if search_tool: # CORREÇÃO: usa a variável correta 'search_tool'
+                if st.button("🔍 Verificar Sentença com Jurisprudência (Google)", key="btn_verificar_sentenca_final", use_container_width=True):
+                    # ... (lógica do botão como você tem)
+                    if sentenca_texto_completo:
+                        with st.spinner("Verificando sentença com jurisprudência... (Pode demorar alguns instantes)"):
+                            st.session_state.verificacao_sentenca_resultado = verificar_sentenca_com_jurisprudencia(sentenca_texto_completo, llm)
+                            st.session_state.show_verificacao_popup = True
+                            st.rerun()
+                    else:
+                        st.warning("Texto da sentença não encontrado para verificação.")
+            else:
+                col_verificador.info("Verificação com Google desabilitada (API não configurada ou falha na inicialização).") # Mensagem atualizada
+
+    # Pop-ups para Ementa e Verificação
+    if st.session_state.get('show_ementa_popup', False) and st.session_state.get('ementa_cnj_gerada'):
+        # REMOVER o if hasattr(st, 'dialog') e usar diretamente o fallback
+        # ---- INÍCIO DO BLOCO DE FALLBACK PARA EMENTA ----
+        with st.container(): # Usar container para simular um modal sobreposto
+            st.markdown("---")
+            st.subheader("📄 Ementa Gerada (Padrão CNJ)")
+            st.markdown(st.session_state.ementa_cnj_gerada)
+            if st.button("Fechar Ementa", key="close_ementa_fallback_v3_corrected"): # Nova chave única
+                st.session_state.show_ementa_popup = False
+                st.session_state.ementa_cnj_gerada = None
+                st.rerun() # Pode ser necessário para fechar/limpar visualmente
+            st.markdown("---")
+        # ---- FIM DO BLOCO DE FALLBACK PARA EMENTA ----
+
+    if st.session_state.get('show_verificacao_popup', False) and st.session_state.get('verificacao_sentenca_resultado'):
+        # REMOVER o if hasattr(st, 'dialog') e usar diretamente o fallback
+        # ---- INÍCIO DO BLOCO DE FALLBACK PARA VERIFICAÇÃO ----
+        with st.container():
+            st.markdown("---")
+            st.subheader("🔍 Verificação da Sentença com Jurisprudência")
+            st.markdown(st.session_state.verificacao_sentenca_resultado)
+            if st.button("Fechar Verificação", key="close_verif_fallback_v3_corrected"): # Nova chave única
+                st.session_state.show_verificacao_popup = False
+                st.session_state.verificacao_sentenca_resultado = None
+                st.rerun() # Pode ser necessário
+            st.markdown("---")
+        # ---- FIM DO BLOCO DE FALLBACK PARA VERIFICAÇÃO ---
+
     st.subheader("📊 Resultados da Simulação")
     doc_completo_placeholder_sim = st.empty()
 
@@ -1573,7 +1956,7 @@ def exibir_resultados_simulacao(estado_final_simulacao: dict):
                     st.markdown(f"<div style='{container_style}'>", unsafe_allow_html=True)
                     st.markdown(f"<div style='font-size: 28px;'>{ator_icon}{etapa_icon}</div>", unsafe_allow_html=True)
                     st.markdown(f"<div style='font-size: 11px; margin-bottom: 3px;'><b>{ator_hist}</b><br>{etapa_hist[:30]}{'...' if len(etapa_hist)>30 else ''}</div>", unsafe_allow_html=True)
-                    if st.button(f"Ver Doc {i+1}", key=f"btn_timeline_sim_{i}_final", help=f"Visualizar: {etapa_hist}", use_container_width=True):
+                    if st.button(f"Ver Doc {i+1}", key=f"btn_timeline_sim_{i}_{estado_final_simulacao.get('id_processo', 'default_pid')}", help=f"Visualizar: {etapa_hist}", use_container_width=True):
                         st.session_state.doc_visualizado = doc_completo_hist
                         st.session_state.doc_visualizado_titulo = f"Documento da Linha do Tempo (Passo {i+1}): {ator_hist} - {etapa_hist}"
                         st.rerun() 
@@ -1588,7 +1971,8 @@ def exibir_resultados_simulacao(estado_final_simulacao: dict):
             if st.button("Fechar Visualização do Documento", key="close_doc_view_sim_btn_main_results_final", type="primary"):
                 st.session_state.doc_visualizado = None
                 st.session_state.doc_visualizado_titulo = ""
-                st.rerun()
+                doc_completo_placeholder_sim.empty()
+                
     
     st.markdown("#### Histórico Detalhado (Conteúdo Completo das Etapas)")
     if 'expand_all_history' not in st.session_state: st.session_state.expand_all_history = False
