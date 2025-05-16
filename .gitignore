@@ -1,3 +1,5 @@
 .env
 .venv
 faiss_index_juridico
+__pycache__
+
