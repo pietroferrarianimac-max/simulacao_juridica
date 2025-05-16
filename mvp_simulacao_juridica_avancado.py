@@ -24,6 +24,10 @@ if not GOOGLE_API_KEY:
     print("Erro: A variável de ambiente GOOGLE_API_KEY não foi definida.")
     exit()
 
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+LANGSMITH_API_KEY = os.environ["LANGSMITH_API_KEY"] 
+os.environ["LANGCHAIN_PROJECT"] = "SimulacaoJuridicaDebug" 
+
 # --- 1. Constantes e Configurações Globais ---
 DATA_PATH = "simulacao_juridica_data"
 PATH_PROCESSO_EM_SI = os.path.join(DATA_PATH, "processo_em_si")
@@ -747,208 +751,168 @@ if __name__ == "__main__":
     st.title("Simulação Jurídica Avançada")
     st.subheader("Rito Ordinário do CPC")
 
-    # Inicializar session_state para visualização de documentos
+    # --- INICIALIZAÇÃO DO SESSION STATE ---
+    if 'simulation_results' not in st.session_state:
+        st.session_state.simulation_results = {} # Armazena {simulation_key: estado_final}
     if 'doc_visualizado' not in st.session_state:
         st.session_state.doc_visualizado = None
         st.session_state.doc_visualizado_titulo = ""
     if 'expand_all_steps' not in st.session_state:
-        st.session_state.expand_all_steps = True
-    if 'expand_all_history' not in st.session_state: # Para os expanders detalhados
-        st.session_state.expand_all_history = False
+        st.session_state.expand_all_steps = True # Começar expandido para ver a execução
+    if 'expand_all_history' not in st.session_state:
+        st.session_state.expand_all_history = False # Começar histórico colapsado
 
     id_processo_simulado = st.text_input("ID do Processo:", "caso_001")
     arquivo_processo_upload = st.file_uploader("Carregar Arquivo do Processo (.docx):", type=["docx"])
-
-    # Placeholder para o documento completo (será usado pela timeline e pelos expanders)
     doc_completo_placeholder = st.empty()
 
     if arquivo_processo_upload is not None:
-        # ... (lógica de upload e inicialização do retriever como antes) ...
         nome_arquivo_temporario = f"temp_{id_processo_simulado}_{arquivo_processo_upload.name}"
         caminho_temp_salvo = os.path.join(PATH_PROCESSO_EM_SI, nome_arquivo_temporario)
-        
         os.makedirs(PATH_PROCESSO_EM_SI, exist_ok=True)
-        
         with open(caminho_temp_salvo, "wb") as f:
             f.write(arquivo_processo_upload.read())
 
-        st.markdown(f"--- INICIANDO SIMULAÇÃO PARA O PROCESSO: **{id_processo_simulado}** ---")
+        st.markdown(f"--- SIMULAÇÃO PARA O PROCESSO: **{id_processo_simulado}** (Arquivo: `{arquivo_processo_upload.name}`) ---")
 
-        retriever_do_caso = None
-        try:
-            with st.spinner("Inicializando sistema RAG e carregando documentos..."):
-                retriever_do_caso = criar_ou_carregar_retriever(id_processo_simulado, nome_arquivo_temporario)
-            st.success("Sistema RAG inicializado com sucesso.")
-        except Exception as e:
-            st.error(f"ERRO FATAL: Falha crítica ao inicializar o sistema RAG. Detalhe: {e}")
-            if os.path.exists(caminho_temp_salvo):
-                os.remove(caminho_temp_salvo) 
-            st.stop()
+        simulation_key = f"{id_processo_simulado}_{arquivo_processo_upload.name}"
+        estado_final_simulacao = None # Inicializa
 
-        estado_inicial = EstadoProcessual(
-            id_processo=id_processo_simulado,
-            retriever=retriever_do_caso,
-            nome_do_ultimo_no_executado=None,
-            etapa_concluida_pelo_ultimo_no=None,
-            proximo_ator_sugerido_pelo_ultimo_no=ADVOGADO_AUTOR,
-            documento_gerado_na_etapa_recente=None,
-            historico_completo=[],
-            pontos_controvertidos_saneamento=None,
-            manifestacao_autor_sem_provas=False,
-            manifestacao_reu_sem_provas=False,
-            etapa_a_ser_executada_neste_turno=""
-        )
-        # ... (lógica da execução da simulação com app.stream e st.expander para os passos como antes) ...
-        st.subheader("Acompanhamento da Simulação:")
-        if st.button("Alternar Expansão dos Passos da Execução"):
-            st.session_state.expand_all_steps = not st.session_state.expand_all_steps
-        progress_bar = st.progress(0)
-        steps_container = st.container()
-        max_passos_simulacao = 15 
-        passo_atual_simulacao = 0
-        estado_final_simulacao = None
-        # ... (Loop app.stream como na versão anterior) ...
-        try:
-            for s in app.stream(input=estado_inicial, config={"recursion_limit": max_passos_simulacao}):
-                passo_atual_simulacao += 1
-                num_total_etapas_estimadas = len(mapa_tarefa_no_atual) + 1
-                progress_value = min(100, int((passo_atual_simulacao / num_total_etapas_estimadas) * 100))
-                progress_bar.progress(progress_value)
-
-                if not isinstance(s, dict) or not s:
-                    msg = f"Erro: Stream retornou valor inesperado: {s}. Encerrando."
-                    steps_container.error(msg)
-                    break
-
-                nome_do_no_executado = list(s.keys())[0]
-                estado_parcial_apos_no = s[nome_do_no_executado]
-                estado_final_simulacao = estado_parcial_apos_no
-
-                etapa_concluida_log = estado_parcial_apos_no.get('etapa_concluida_pelo_ultimo_no', 'N/A')
-                doc_gerado_completo = str(estado_parcial_apos_no.get('documento_gerado_na_etapa_recente', ''))
-                prox_ator_sug_log = estado_parcial_apos_no.get('proximo_ator_sugerido_pelo_ultimo_no', 'N/A')
-                
-                expander_title = f"Passo {passo_atual_simulacao}: {nome_do_no_executado} concluiu '{etapa_concluida_log}'"
-                if nome_do_no_executado == END:
-                     expander_title = f"Passo {passo_atual_simulacao}: Fim da Simulação"
-                
-                with steps_container.expander(expander_title, expanded=st.session_state.expand_all_steps):
-                    st.markdown(f"**Nó Executado:** `{nome_do_no_executado}`")
-                    st.markdown(f"**Etapa Concluída:** `{etapa_concluida_log}`")
-                    if etapa_concluida_log != "ERRO_FLUXO_IRRECUPERAVEL" and doc_gerado_completo:
-                        st.text_area("Documento Gerado:", value=doc_gerado_completo, height=200, key=f"doc_step_{passo_atual_simulacao}", disabled=True)
-                    elif doc_gerado_completo:
-                        st.error(f"Detalhe do Erro/Documento: {doc_gerado_completo}")
-                    st.markdown(f"**Próximo Ator Sugerido:** `{prox_ator_sug_log}`")
-
-                if nome_do_no_executado == END or prox_ator_sug_log == ETAPA_FIM_PROCESSO:
-                    steps_container.success("Fluxo da simulação atingiu o nó FINAL ou etapa de fim.")
-                    progress_bar.progress(100)
-                    break
-                if passo_atual_simulacao >= max_passos_simulacao:
-                    steps_container.warning(f"Simulação atingiu o limite máximo de {max_passos_simulacao} passos.")
-                    break
-        except Exception as e:
-            st.error(f"ERRO INESPERADO DURANTE A EXECUÇÃO DA SIMULAÇÃO: {e}")
-            import traceback
-            st.text_area("Stack Trace do Erro:", traceback.format_exc(), height=300)
-        finally:
-            if os.path.exists(caminho_temp_salvo):
-                os.remove(caminho_temp_salvo)
-                print(f"[Main] Arquivo temporário '{caminho_temp_salvo}' removido.")
-            progress_bar.empty()
-
-        st.markdown("---")
-        st.subheader("Linha do Tempo Interativa do Processo")
-
-        if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
-            historico = estado_final_simulacao["historico_completo"]
-            
-            # Mapeamento de ícones (Unicode emojis)
-            icon_map = {
-                ADVOGADO_AUTOR: "🙋‍♂️", # Pessoa levantando a mão (autor)
-                JUIZ: "⚖️",          # Balança da justiça
-                ADVOGADO_REU: "🙋‍♀️", # Pessoa levantando a mão (réu - outra figura)
-                ETAPA_PETICAO_INICIAL: "📄",
-                ETAPA_DESPACHO_RECEBENDO_INICIAL: "➡️",
-                ETAPA_CONTESTACAO: " دفاع ", # Defesa em árabe (exemplo visual) ou "🛡️",
-                ETAPA_DECISAO_SANEAMENTO: "🛠️",
-                ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR: "🗣️",
-                ETAPA_MANIFESTACAO_SEM_PROVAS_REU: "🗣️",
-                ETAPA_SENTENCA: "🏁",
-                "DEFAULT_ACTOR": "👤",
-                "DEFAULT_ETAPA": "📑"
-            }
-
-            # Criar colunas para a linha do tempo. O número de colunas é o número de etapas.
-            # Se for muito grande, o Streamlit vai empilhar.
-            # Para um visual mais controlado, poderíamos limitar o número de itens por linha
-            # ou usar um container com overflow CSS (mais complexo).
-            # Por simplicidade, vamos usar colunas diretas.
-            
-            num_etapas = len(historico)
-            cols = st.columns(num_etapas)
-
-            for i, item_hist in enumerate(historico):
-                ator_hist = item_hist.get('ator', 'N/A')
-                etapa_hist = item_hist.get('etapa', 'N/A')
-                doc_completo_hist = str(item_hist.get('documento', 'N/A'))
-                
-                ator_icon = icon_map.get(ator_hist, icon_map["DEFAULT_ACTOR"])
-                etapa_icon = icon_map.get(etapa_hist, icon_map["DEFAULT_ETAPA"])
-
-                with cols[i]:
-                    # Exibir o ícone do ator e da etapa de forma proeminente
-                    st.markdown(f"<div style='text-align: center; font-size: 24px;'>{ator_icon}{etapa_icon}</div>", unsafe_allow_html=True)
-                    # Nome do ator e etapa abaixo dos ícones
-                    st.markdown(f"<p style='text-align: center; font-size: 12px; margin-bottom: 5px;'><b>{ator_hist}</b><br>{etapa_hist}</p>", unsafe_allow_html=True)
-                    
-                    # Botão para ver o documento
-                    if st.button(f"Doc {i+1}", key=f"btn_timeline_{i}", help=f"Ver documento: {ator_hist} - {etapa_hist}"):
-                        st.session_state.doc_visualizado = doc_completo_hist
-                        st.session_state.doc_visualizado_titulo = f"Documento (Etapa {i+1} da Linha do Tempo): {ator_hist} - {etapa_hist}"
-                        # st.rerun() # Geralmente não necessário se o placeholder estiver fora do loop de colunas
-
-                # Adicionar uma "seta" ou conector entre as colunas, exceto para a última
-                # Isso é difícil de fazer de forma robusta com st.columns diretamente.
-                # Poderíamos tentar com st.markdown entre as colunas, mas o alinhamento é complexo.
-                # Para esta versão, omitiremos as setas conectoras complexas entre colunas.
-                # Uma linha simples abaixo da "faixa" da timeline pode ser uma opção.
-            
-            if num_etapas > 0:
-                 st.markdown("---") # Linha separadora após a timeline
-
+        if simulation_key in st.session_state.simulation_results:
+            st.info(f"Carregando resultado da simulação anterior para '{simulation_key}'.")
+            estado_final_simulacao = st.session_state.simulation_results[simulation_key]
+            # Não precisa mostrar a seção "Acompanhamento da Simulação" se já foi executado
+            # Ou você pode optar por mostrá-la de forma estática com os resultados cacheados
         else:
-            st.warning("Nenhum histórico completo disponível para exibir na linha do tempo.")
+            st.subheader("Acompanhamento da Simulação:") # Mostrar apenas na primeira execução
+            if st.button("Alternar Expansão dos Passos da Execução", key="toggle_steps_exec"):
+                st.session_state.expand_all_steps = not st.session_state.expand_all_steps
+            
+            progress_bar = st.progress(0)
+            steps_container = st.container() # Container para os passos da simulação
+            max_passos_simulacao = 15
+            passo_atual_simulacao = 0
+            
+            retriever_do_caso = None
+            try:
+                with st.spinner("Inicializando sistema RAG e carregando documentos..."):
+                    retriever_do_caso = criar_ou_carregar_retriever(id_processo_simulado, nome_arquivo_temporario)
+                st.success("Sistema RAG inicializado com sucesso.")
 
-        # Exibição do documento completo selecionado (fora do loop do histórico)
-        # Este placeholder é crucial e deve estar FORA de qualquer loop de colunas ou expanders.
-        if st.session_state.doc_visualizado:
-            with doc_completo_placeholder.container():
-                st.subheader(st.session_state.doc_visualizado_titulo)
-                st.text_area("Conteúdo do Documento:", st.session_state.doc_visualizado, height=400, key="doc_view_timeline_area")
-                if st.button("Fechar Visualização do Documento", key="close_doc_view_timeline_btn"):
-                    st.session_state.doc_visualizado = None
-                    st.session_state.doc_visualizado_titulo = ""
-                    st.rerun()
+                estado_inicial = EstadoProcessual(
+                    id_processo=id_processo_simulado, retriever=retriever_do_caso,
+                    nome_do_ultimo_no_executado=None, etapa_concluida_pelo_ultimo_no=None,
+                    proximo_ator_sugerido_pelo_ultimo_no=ADVOGADO_AUTOR,
+                    documento_gerado_na_etapa_recente=None, historico_completo=[],
+                    pontos_controvertidos_saneamento=None, manifestacao_autor_sem_provas=False,
+                    manifestacao_reu_sem_provas=False, etapa_a_ser_executada_neste_turno=""
+                )
+
+                for s in app.stream(input=estado_inicial, config={"recursion_limit": max_passos_simulacao}):
+                    passo_atual_simulacao += 1
+                    # ... (lógica da barra de progresso e atualização do estado_final_simulacao) ...
+                    nome_do_no_executado = list(s.keys())[0] # Adicionado para definir a variável
+                    estado_parcial_apos_no = s[nome_do_no_executado] # Adicionado para definir a variável
+                    estado_final_simulacao = estado_parcial_apos_no # Atualiza a cada passo
+
+                    etapa_concluida_log = estado_parcial_apos_no.get('etapa_concluida_pelo_ultimo_no', 'N/A')
+                    doc_gerado_completo = str(estado_parcial_apos_no.get('documento_gerado_na_etapa_recente', ''))
+                    prox_ator_sug_log = estado_parcial_apos_no.get('proximo_ator_sugerido_pelo_ultimo_no', 'N/A')
+
+                    expander_title = f"Passo {passo_atual_simulacao}: {nome_do_no_executado} concluiu '{etapa_concluida_log}'"
+                    if nome_do_no_executado == END:
+                         expander_title = f"Passo {passo_atual_simulacao}: Fim da Simulação"
+                    
+                    with steps_container.expander(expander_title, expanded=st.session_state.expand_all_steps):
+                        st.markdown(f"**Nó Executado:** `{nome_do_no_executado}`")
+                        # ... (resto da lógica do expander do passo)
+                        st.markdown(f"**Etapa Concluída:** `{etapa_concluida_log}`")
+                        if etapa_concluida_log != "ERRO_FLUXO_IRRECUPERAVEL" and doc_gerado_completo:
+                            st.text_area("Documento Gerado:", value=doc_gerado_completo, height=200, key=f"doc_step_{passo_atual_simulacao}", disabled=True)
+                        elif doc_gerado_completo:
+                            st.error(f"Detalhe do Erro/Documento: {doc_gerado_completo}")
+                        st.markdown(f"**Próximo Ator Sugerido:** `{prox_ator_sug_log}`")
+
+
+                    if nome_do_no_executado == END or prox_ator_sug_log == ETAPA_FIM_PROCESSO:
+                        steps_container.success("Fluxo da simulação atingiu o nó FINAL ou etapa de fim.")
+                        progress_bar.progress(100)
+                        st.session_state.simulation_results[simulation_key] = estado_final_simulacao # Cache
+                        break 
+                    if passo_atual_simulacao >= max_passos_simulacao:
+                        steps_container.warning(f"Simulação atingiu o limite máximo de {max_passos_simulacao} passos.")
+                        st.session_state.simulation_results[simulation_key] = estado_final_simulacao # Cache
+                        break
+                
+                # Garantir que o estado final seja salvo mesmo se o loop terminar sem break explícito (improvável aqui)
+                if simulation_key not in st.session_state.simulation_results and estado_final_simulacao:
+                    st.session_state.simulation_results[simulation_key] = estado_final_simulacao
+
+            except Exception as e:
+                st.error(f"ERRO INESPERADO DURANTE A EXECUÇÃO DA SIMULAÇÃO: {e}")
+                import traceback
+                st.text_area("Stack Trace do Erro:", traceback.format_exc(), height=300)
+            finally:
+                if 'progress_bar' in locals(): progress_bar.empty()
         
-        st.markdown("---")
-        # Manter a seção de Histórico Detalhado com expanders se ainda for útil
-        st.subheader("Histórico Detalhado (Conteúdo das Etapas):")
-        # (O código dos expanders do histórico detalhado pode permanecer aqui, como antes)
-        if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
-            if st.button("Alternar Expansão dos Itens do Histórico Detalhado"):
-                st.session_state.expand_all_history = not st.session_state.expand_all_history
-            for i, item_hist in enumerate(estado_final_simulacao["historico_completo"]):
-                ator_hist = item_hist.get('ator', 'N/A')
-                etapa_hist = item_hist.get('etapa', 'N/A')
-                doc_completo_hist = str(item_hist.get('documento', 'N/A'))
-                with st.expander(f"{i+1}. Ator: {ator_hist} | Etapa: {etapa_hist}", expanded=st.session_state.expand_all_history):
-                    # ... (conteúdo do expander como antes, mas o botão de ver documento aqui pode ser removido se a timeline for suficiente)
-                    st.text_area(f"Documento Gerado (Detalhe {i+1}):", value=doc_completo_hist, height=150, key=f"doc_hist_detail_{i}", disabled=True)
+        # --- EXIBIÇÃO DA LINHA DO TEMPO E HISTÓRICO (USA estado_final_simulacao) ---
+        if estado_final_simulacao:
+            st.markdown("---")
+            st.subheader("Linha do Tempo Interativa do Processo")
+            if estado_final_simulacao.get("historico_completo"):
+                # ... (código da linha do tempo como antes) ...
+                 historico = estado_final_simulacao["historico_completo"]
+                 icon_map = { ADVOGADO_AUTOR: "🙋‍♂️", JUIZ: "⚖️", ADVOGADO_REU: "🙋‍♀️", ETAPA_PETICAO_INICIAL: "📄", ETAPA_DESPACHO_RECEBENDO_INICIAL: "➡️", ETAPA_CONTESTACAO: "🛡️", ETAPA_DECISAO_SANEAMENTO: "🛠️", ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR: "🗣️", ETAPA_MANIFESTACAO_SEM_PROVAS_REU: "🗣️", ETAPA_SENTENCA: "🏁", "DEFAULT_ACTOR": "👤", "DEFAULT_ETAPA": "📑" }
+                 num_etapas = len(historico)
+                 if num_etapas > 0 :
+                    cols = st.columns(num_etapas)
+                    for i, item_hist in enumerate(historico):
+                        ator_hist = item_hist.get('ator', 'N/A')
+                        etapa_hist = item_hist.get('etapa', 'N/A')
+                        doc_completo_hist = str(item_hist.get('documento', 'N/A'))
+                        ator_icon = icon_map.get(ator_hist, icon_map["DEFAULT_ACTOR"])
+                        etapa_icon = icon_map.get(etapa_hist, icon_map["DEFAULT_ETAPA"])
+                        with cols[i]:
+                            st.markdown(f"<div style='text-align: center; font-size: 24px;'>{ator_icon}{etapa_icon}</div>", unsafe_allow_html=True)
+                            st.markdown(f"<p style='text-align: center; font-size: 12px; margin-bottom: 5px;'><b>{ator_hist}</b><br>{etapa_hist}</p>", unsafe_allow_html=True)
+                            if st.button(f"Doc {i+1}", key=f"btn_timeline_{i}", help=f"Ver documento: {ator_hist} - {etapa_hist}"):
+                                st.session_state.doc_visualizado = doc_completo_hist
+                                st.session_state.doc_visualizado_titulo = f"Documento (Etapa {i+1} da Linha do Tempo): {ator_hist} - {etapa_hist}"
+                    st.markdown("---") 
+            else:
+                st.warning("Nenhum histórico completo disponível para exibir na linha do tempo.")
 
-        st.markdown("--- FIM DA SIMULAÇÃO ---")
-        print("\n[Main] Execução da simulação Streamlit concluída.")
+            # Exibição do documento completo selecionado
+            if st.session_state.doc_visualizado:
+                with doc_completo_placeholder.container():
+                    st.subheader(st.session_state.doc_visualizado_titulo)
+                    st.text_area("Conteúdo do Documento:", st.session_state.doc_visualizado, height=400, key="doc_view_area")
+                    if st.button("Fechar Visualização do Documento", key="close_doc_view_btn"):
+                        st.session_state.doc_visualizado = None
+                        st.session_state.doc_visualizado_titulo = ""
+                        st.rerun()
+            
+            st.markdown("---")
+            st.subheader("Histórico Detalhado (Conteúdo das Etapas):")
+            if estado_final_simulacao.get("historico_completo"):
+                if st.button("Alternar Expansão dos Itens do Histórico Detalhado", key="toggle_hist_detail"):
+                    st.session_state.expand_all_history = not st.session_state.expand_all_history
+                for i, item_hist in enumerate(estado_final_simulacao["historico_completo"]):
+                     # ... (código do expander do histórico detalhado como antes) ...
+                    ator_hist = item_hist.get('ator', 'N/A')
+                    etapa_hist = item_hist.get('etapa', 'N/A')
+                    doc_completo_hist = str(item_hist.get('documento', 'N/A'))
+                    with st.expander(f"{i+1}. Ator: {ator_hist} | Etapa: {etapa_hist}", expanded=st.session_state.expand_all_history):
+                        st.text_area(f"Documento Gerado (Detalhe {i+1}):", value=doc_completo_hist, height=150, key=f"doc_hist_detail_{i}", disabled=True)
 
+            st.markdown("--- FIM DA SIMULAÇÃO ---")
+        else:
+             if arquivo_processo_upload: # Só mostrar se um arquivo foi carregado
+                st.warning("A simulação não foi concluída ou nenhum resultado final foi gerado.")
+        
+        # Limpeza do arquivo temporário movida para o final do bloco if arquivo_processo_upload
+        if os.path.exists(caminho_temp_salvo):
+            os.remove(caminho_temp_salvo)
+            print(f"[Main] Arquivo temporário '{caminho_temp_salvo}' removido.")
     else:
         st.info("Aguardando upload do arquivo do processo para iniciar a simulação.")
