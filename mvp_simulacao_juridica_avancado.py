@@ -983,13 +983,6 @@ if GOOGLE_API_KEY_SEARCH and GOOGLE_CSE_ID:
 else:
     print("[AVISO] Chaves de API para busca não definidas. Ferramenta search_tool desabilitada.")
 
-# Para usar a ferramenta:
-if search_tool:
-    try:
-        resultados = search_tool.invoke("sua query de busca")
-        print(resultados)
-    except Exception as e_invoke_tool:
-        print(f"Erro ao invocar a ferramenta search_tool: {e_invoke_tool}")
 
 def verificar_sentenca_com_jurisprudencia(texto_sentenca: str, llm_usado: ChatGoogleGenerativeAI) -> str:
     """
