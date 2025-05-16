@@ -5,6 +5,7 @@ import shutil # Para limpar a pasta FAISS se necessário
 import time # Para ID único de processo
 from dotenv import load_dotenv
 from typing import TypedDict, List, Union, Dict, Tuple, Any
+import json
 
 # LangChain & LangGraph
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -201,8 +202,11 @@ class EstadoProcessual(TypedDict):
     manifestacao_autor_sem_provas: bool
     manifestacao_reu_sem_provas: bool
     
-    # NOVO: Para carregar dados do formulário Streamlit
+    # Para carregar dados do formulário Streamlit (incluirá documentos do autor)
     dados_formulario_entrada: Union[Dict[str, Any], None]
+
+    # Para armazenar documentos juntados pelo Réu após a contestação
+    documentos_juntados_pelo_reu: Union[List[Dict[str, str]], None] 
 
 
 # --- 5. Mapa de Fluxo Processual (Rito Ordinário) ---
@@ -235,6 +239,7 @@ def decidir_proximo_no_do_grafo(estado: EstadoProcessual):
 
 # --- 7. Helpers e Agentes (Nós do Grafo) ---
 
+
 def criar_prompt_e_chain(template_string: str):
     prompt = ChatPromptTemplate.from_template(template_string)
     return prompt | llm | StrOutputParser()
@@ -258,50 +263,52 @@ def helper_logica_inicial_no(estado: EstadoProcessual, nome_do_no_atual: str) ->
     print(f"[{nome_do_no_atual}] Iniciando. Etapa designada: {etapa_designada}.")
     return etapa_designada
 
+def formatar_lista_documentos_para_prompt(documentos: List[Dict[str, str]], parte_nome: str) -> str:
+    if not documentos:
+        return f"Nenhum documento específico foi listado por {parte_nome} para esta etapa."
+    texto_docs = f"\n\n**Documentos que acompanham esta petição ({parte_nome}):**\n"
+    for i, doc in enumerate(documentos):
+        texto_docs += f"{i+1}. **Tipo:** {doc.get('tipo', 'N/A')}\n   **Descrição/Propósito:** {doc.get('descricao', 'N/A')}\n"
+    return texto_docs
+
 def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
     etapa_atual_do_no = helper_logica_inicial_no(estado, ADVOGADO_AUTOR)
     print(f"\n--- TURNO: {ADVOGADO_AUTOR} (Executando Etapa: {etapa_atual_do_no}) ---")
 
-    # (Lógica de erro e inicialização de variáveis como antes)
     if etapa_atual_do_no == "ERRO_ETAPA_NAO_ENCONTRADA":
-        # ... (mesma lógica de erro)
         return {
             "nome_do_ultimo_no_executado": ADVOGADO_AUTOR, "etapa_concluida_pelo_ultimo_no": "ERRO_FLUXO_IRRECUPERAVEL",
             "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO, "documento_gerado_na_etapa_recente": "Erro crítico de fluxo.",
             "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": ADVOGADO_AUTOR, "documento": "Erro de fluxo."}],
-            "id_processo": estado.get("id_processo"), "retriever": estado.get("retriever"),
-            "dados_formulario_entrada": estado.get("dados_formulario_entrada")
+            **{k: v for k, v in estado.items() if k not in ["nome_do_ultimo_no_executado", "etapa_concluida_pelo_ultimo_no", "proximo_ator_sugerido_pelo_ultimo_no", "documento_gerado_na_etapa_recente", "historico_completo"]}
         }
 
     documento_gerado = f"Documento padrão para {ADVOGADO_AUTOR} na etapa {etapa_atual_do_no} não gerado."
-    proximo_ator_logico = JUIZ
+    proximo_ator_logico = JUIZ # Padrão
     retriever = estado["retriever"]
     id_processo = estado["id_processo"]
     dados_formulario = estado.get("dados_formulario_entrada", {})
     historico_formatado = "\n".join([f"- Etapa: {item['etapa']}, Ator: {item['ator']}:\n  Documento: {item['documento'][:150]}..." for item in estado.get("historico_completo", [])])
     if not historico_formatado: historico_formatado = "Este é o primeiro ato do processo."
 
-    # --- Lógica de RAG para contexto (pode ser menos crucial para PI se dados do formulário são completos) ---
-    # query_fatos_caso = f"Resumo dos fatos e principais pontos do processo {id_processo}"
-    # docs_fatos_caso = retriever.get_relevant_documents(query=query_fatos_caso) if retriever else []
-    # contexto_fatos_caso_rag = "\n".join([doc.page_content for doc in docs_fatos_caso]) if docs_fatos_caso else "Nenhum detalhe factual do RAG."
-    # print(f"[{ADVOGADO_AUTOR}-{etapa_atual_do_no}] Contexto do caso (RAG): {contexto_fatos_caso_rag[:200]}...")
-
-
     if etapa_atual_do_no == ETAPA_PETICAO_INICIAL:
-        docs_modelo_pi = retriever.get_relevant_documents(query="modelo de petição inicial completa", filter={"source_type": "modelo_peticao"}) if retriever else []
+        docs_modelo_pi = retriever.get_relevant_documents(query="modelo de petição inicial cível completa e bem estruturada", filter={"source_type": "modelo_peticao"}) if retriever else []
         modelo_texto_guia = docs_modelo_pi[0].page_content if docs_modelo_pi else "ERRO RAG: Modelo de petição inicial não encontrado."
         
-        # Usar dados do formulário como base para a Petição Inicial
         qualificacao_autor_form = dados_formulario.get("qualificacao_autor", "Qualificação do Autor não fornecida.")
         qualificacao_reu_form = dados_formulario.get("qualificacao_reu", "Qualificação do Réu não fornecida.")
-        natureza_acao_form = dados_formulario.get("natureza_acao", "Natureza da ação não fornecida.")
+        # natureza_acao_form é preenchida pelo usuário ao final do formulário, com sugestão da IA
+        natureza_acao_form = dados_formulario.get("natureza_acao", "Natureza da ação não fornecida ou a ser definida.")
         fatos_form = dados_formulario.get("fatos", "Fatos não fornecidos.")
         direito_form = dados_formulario.get("fundamentacao_juridica", "Fundamentação jurídica não fornecida.")
         pedidos_form = dados_formulario.get("pedidos", "Pedidos não fornecidos.")
+        
+        # MODIFICAÇÃO: Recuperar e formatar documentos do autor
+        documentos_autor_lista = dados_formulario.get("documentos_autor", [])
+        documentos_autor_texto_formatado = formatar_lista_documentos_para_prompt(documentos_autor_lista, "Autor")
 
         template_prompt_pi = f"""
-        Você é um Advogado do Autor e está elaborando uma Petição Inicial completa e formal.
+        Você é um Advogado do Autor experiente e está elaborando uma Petição Inicial completa, formal e persuasiva.
         **Processo ID:** {{id_processo}}
 
         **Dados Base Fornecidos para a Petição:**
@@ -311,7 +318,7 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
         Qualificação do Réu:
         {qualificacao_reu_form}
 
-        Natureza da Ação: {natureza_acao_form}
+        Natureza da Ação (definida pelo usuário/IA): {natureza_acao_form}
 
         Dos Fatos:
         {fatos_form}
@@ -321,71 +328,74 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
 
         Dos Pedidos:
         {pedidos_form}
-
-        **Modelo/Guia Estrutural de Petição Inicial (RAG - use para formatação e completude, mas priorize os dados fornecidos acima):**
+        {documentos_autor_texto_formatado} 
+        **Modelo/Guia Estrutural de Petição Inicial (RAG - use para formatação, completude e referências legais, mas priorize os dados fornecidos acima para o conteúdo do caso):**
         {{modelo_texto_guia}}
         
-        **Histórico Processual (se houver, para outros contextos):**
-        {{historico_formatado}}
-        ---
-        Com base em TODAS as informações acima, especialmente os DADOS BASE FORNECIDOS, redija a Petição Inicial completa e bem formatada.
-        Certifique-se de que todos os elementos dos dados base (fatos, direito, pedidos, qualificações) estejam integralmente e corretamente incorporados.
+        **Instruções Adicionais:**
+        1. Redija a Petição Inicial completa e bem formatada, seguindo a praxe forense.
+        2. Certifique-se de que todos os elementos dos DADOS BASE (fatos, direito, pedidos, qualificações, natureza da ação) estejam integralmente e corretamente incorporados.
+        3. No corpo da petição (especialmente na narração dos fatos ou antes dos pedidos), faça menção aos principais documentos listados em "Documentos que acompanham esta petição (Autor)", indicando sua relevância para comprovar as alegações.
+        4. Conclua com os requerimentos de praxe (data, assinatura do advogado).
+
         Petição Inicial:
         """
         chain_pi = criar_prompt_e_chain(template_prompt_pi)
         documento_gerado = chain_pi.invoke({
             "id_processo": id_processo,
             "modelo_texto_guia": modelo_texto_guia,
-            "historico_formatado": historico_formatado
-            # Os dados do formulário já estão no template_prompt_pi
+            "historico_formatado": historico_formatado # Mantido para outros contextos, menos relevante para PI
         })
         proximo_ator_logico = JUIZ
 
     elif etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR:
-        # (Lógica como antes, usando RAG para modelo de manifestação)
         decisao_saneamento_recebida = estado.get("documento_gerado_na_etapa_recente", "ERRO: Decisão de Saneamento não encontrada no estado.")
-        pontos_controvertidos = estado.get("pontos_controvertidos_saneamento", "Pontos controvertidos não detalhados.")
-        docs_modelo_manifest = retriever.get_relevant_documents(query="modelo de petição ou manifestação declarando não ter mais provas a produzir", filter={"source_type": "modelo_peticao"}) if retriever else []
-        modelo_texto_guia = docs_modelo_manifest[0].page_content if docs_modelo_manifest else "ERRO RAG: Modelo de manifestação sem provas não encontrado."
+        pontos_controvertidos = estado.get("pontos_controvertidos_saneamento", "Pontos controvertidos não definidos na decisão de saneamento.")
+        historico_completo_formatado_para_prompt = "\n".join([f"### Documento da Etapa: {item['etapa']} (Ator: {item['ator']})\n{item['documento']}\n---" for item in estado.get("historico_completo", [])])
 
-        template_prompt_manifest_autor = """
-        Você é o Advogado do Autor. O juiz proferiu Decisão de Saneamento e intimou as partes a especificarem provas.
-        **Processo ID:** {id_processo}
-        **Tarefa:** Elaborar uma petição informando que o Autor não possui mais provas a produzir.
-        **Decisão de Saneamento proferida pelo Juiz:**
+
+        template_prompt_manifestacao_autor = f"""
+        Você é o Advogado do Autor. O Juiz proferiu a Decisão de Saneamento e intimou as partes para especificarem as provas que pretendem produzir, ou manifestarem desinteresse na produção de mais provas.
+        Seu cliente (Autor) informou que não possui mais provas a produzir e deseja o julgamento antecipado da lide, se o Réu também não tiver provas.
+
+        **Processo ID:** {{id_processo}}
+
+        **Decisão de Saneamento Recebida do Juiz:**
         {decisao_saneamento_recebida}
-        (Pontos Controvertidos principais: {pontos_controvertidos})
-        **Modelo/Guia de Manifestação (use como referência):**
-        {modelo_texto_guia}
-        **Histórico Processual:**
-        {historico_formatado}
-        ---
-        Redija a Petição de Manifestação do Autor.
-        Manifestação:
+
+        **Pontos Controvertidos Fixados na Decisão de Saneamento:**
+        {pontos_controvertidos}
+
+        **Histórico Processual Anterior (para contexto):**
+        {historico_completo_formatado_para_prompt}
+
+        **Instruções:**
+        1. Redija uma petição de "Manifestação Sobre Provas (Autor)".
+        2. Na petição, declare que o Autor não tem outras provas a produzir, além daquelas já constantes nos autos (documentais).
+        3. Requeira o julgamento do processo no estado em que se encontra (julgamento antecipado do mérito), caso o Réu também não especifique provas a produzir ou se as provas especificadas por ele forem apenas documentais já apresentadas ou impertinentes.
+        4. Mantenha a formalidade e praxe forense. Conclua com data e assinatura do advogado.
+
+        Manifestação Sobre Provas (Autor):
         """
-        chain_manifest_autor = criar_prompt_e_chain(template_prompt_manifest_autor)
-        documento_gerado = chain_manifest_autor.invoke({
+        chain_manifestacao_autor = criar_prompt_e_chain(template_prompt_manifestacao_autor)
+        documento_gerado = chain_manifestacao_autor.invoke({
             "id_processo": id_processo,
-            "decisao_saneamento_recebida": decisao_saneamento_recebida,
-            "pontos_controvertidos": pontos_controvertidos,
-            "modelo_texto_guia": modelo_texto_guia,
-            "historico_formatado": historico_formatado
+            # "historico_formatado": historico_formatado # Já incluído no prompt acima de forma mais completa
         })
         proximo_ator_logico = ADVOGADO_REU
+
 
     else:
         print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {ADVOGADO_AUTOR} não implementada completamente.")
         documento_gerado = f"Conteúdo para {ADVOGADO_AUTOR} na etapa {etapa_atual_do_no}."
-        proximo_ator_logico = JUIZ
+        # proximo_ator_logico já é JUIZ por padrão, pode precisar de ajuste dependendo da etapa não implementada
 
     print(f"[{ADVOGADO_AUTOR}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
     
     novo_historico_item = {"etapa": etapa_atual_do_no, "ator": ADVOGADO_AUTOR, "documento": documento_gerado}
     historico_atualizado = estado.get("historico_completo", []) + [novo_historico_item]
 
-    # Preservar o estado
-    estado_retorno = {k: v for k, v in estado.items()}
-    estado_retorno.update({
+    estado_retorno_parcial = {
         "nome_do_ultimo_no_executado": ADVOGADO_AUTOR,
         "etapa_concluida_pelo_ultimo_no": etapa_atual_do_no,
         "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
@@ -393,53 +403,53 @@ def agente_advogado_autor(estado: EstadoProcessual) -> Dict[str, Any]:
         "historico_completo": historico_atualizado,
         "manifestacao_autor_sem_provas": estado.get("manifestacao_autor_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR),
         "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
-    })
-    return estado_retorno
+    }
+    # Preserva outros campos do estado que não foram explicitamente modificados
+    estado_final_retorno = {**estado, **estado_retorno_parcial}
+    return estado_final_retorno
+
 
 def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
     etapa_atual_do_no = helper_logica_inicial_no(estado, JUIZ)
     print(f"\n--- TURNO: {JUIZ} (Executando Etapa: {etapa_atual_do_no}) ---")
-    # (Lógica de erro e inicialização de variáveis como antes)
+    
     if etapa_atual_do_no == "ERRO_ETAPA_NAO_ENCONTRADA":
         return {
             "nome_do_ultimo_no_executado": JUIZ, "etapa_concluida_pelo_ultimo_no": "ERRO_FLUXO_IRRECUPERAVEL",
             "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO, "documento_gerado_na_etapa_recente": "Erro Juiz.",
-            "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": JUIZ, "documento": "Erro Juiz."}],
-             "id_processo": estado.get("id_processo"), "retriever": estado.get("retriever"),
-             "dados_formulario_entrada": estado.get("dados_formulario_entrada")
+             "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": JUIZ, "documento": "Erro Juiz."}],
+            **{k: v for k, v in estado.items() if k not in ["nome_do_ultimo_no_executado", "etapa_concluida_pelo_ultimo_no", "proximo_ator_sugerido_pelo_ultimo_no", "documento_gerado_na_etapa_recente", "historico_completo"]}
         }
 
     documento_gerado = f"Decisão padrão para {JUIZ} na etapa {etapa_atual_do_no} não gerada."
-    proximo_ator_logico = ETAPA_FIM_PROCESSO
+    proximo_ator_logico = ETAPA_FIM_PROCESSO # Padrão
     retriever = estado["retriever"]
     id_processo = estado["id_processo"]
-    # dados_formulario = estado.get("dados_formulario_entrada", {}) # Juiz geralmente não usa dados primários do form
     historico_formatado = "\n".join([f"- Etapa: {item['etapa']}, Ator: {item['ator']}:\n  Documento: {item['documento'][:150]}..." for item in estado.get("historico_completo", [])])
     if not historico_formatado: historico_formatado = "Histórico não disponível."
-    documento_da_parte_para_analise = estado.get("documento_gerado_na_etapa_recente", "Nenhuma petição recente.")
+    documento_da_parte_para_analise = estado.get("documento_gerado_na_etapa_recente", "Nenhuma petição ou manifestação recente para análise.")
     
-    # Contexto RAG (se necessário, ex: para fundamentar com base nos fatos do caso já indexados)
-    # query_fatos_caso_juiz = f"Resumo dos fatos e principais pontos do processo {id_processo} para decisão judicial"
-    # docs_fatos_caso_juiz = retriever.get_relevant_documents(query=query_fatos_caso_juiz) if retriever else []
-    # contexto_fatos_caso_rag_juiz = "\n".join([doc.page_content for doc in docs_fatos_caso_juiz]) if docs_fatos_caso_juiz else "Nenhum detalhe factual do RAG para o juiz."
-    contexto_fatos_caso_rag_juiz = "Contexto RAG do caso para o juiz (simplificado para este exemplo)." # Placeholder
-
-    pontos_controvertidos_definidos = estado.get("pontos_controvertidos_saneamento")
+    contexto_fatos_caso_rag_juiz = "Contexto RAG do caso para o juiz (simplificado para este exemplo)." 
+    pontos_controvertidos_definidos = estado.get("pontos_controvertidos_saneamento") # Para uso posterior
 
     if etapa_atual_do_no == ETAPA_DESPACHO_RECEBENDO_INICIAL:
-        docs_modelo_despacho = retriever.get_relevant_documents(query="modelo de despacho judicial recebendo petição inicial", filter={"source_type": "modelo_juiz"}) if retriever else []
+        docs_modelo_despacho = retriever.get_relevant_documents(query="modelo de despacho judicial cível recebendo petição inicial e determinando citação", filter={"source_type": "modelo_juiz"}) if retriever else []
         modelo_texto_guia = docs_modelo_despacho[0].page_content if docs_modelo_despacho else "ERRO RAG: Modelo de despacho inicial não encontrado."
+        
+        # A petição inicial (documento_da_parte_para_analise) já contém a menção aos docs do autor.
         template_prompt = """
-        Você é um Juiz de Direito. Analise a Petição Inicial e profira um despacho inicial.
+        Você é um Juiz de Direito. Analise a Petição Inicial apresentada e, se estiver em ordem, profira um despacho inicial determinando a citação do réu.
+        Considere os documentos que acompanham a inicial, conforme nela mencionados.
         **Processo ID:** {id_processo}
-        **Petição Inicial apresentada pelo Autor:**
+        **Petição Inicial apresentada pelo Autor (pode incluir menção a documentos anexos):**
         {peticao_inicial}
-        **Modelo/Guia de Despacho (use como referência):**
+        **Modelo/Guia de Despacho (use como referência para estrutura e formalidades):**
         {modelo_texto_guia}
-        **Histórico Processual:**
+        **Histórico Processual (se houver):**
         {historico_formatado}
         ---
-        Redija o Despacho Inicial.
+        Redija o Despacho Inicial. Se a petição estiver apta, defira a inicial e ordene a citação do réu para apresentar contestação no prazo legal.
+        Mencione brevemente o recebimento da inicial e dos documentos que a instruem, se relevante.
         Despacho Inicial:
         """
         chain = criar_prompt_e_chain(template_prompt)
@@ -452,83 +462,162 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
         proximo_ator_logico = ADVOGADO_REU
 
     elif etapa_atual_do_no == ETAPA_DECISAO_SANEAMENTO:
-        docs_modelo_saneamento = retriever.get_relevant_documents(query="modelo de decisão de saneamento", filter={"source_type": "modelo_juiz"}) if retriever else []
+        docs_modelo_saneamento = retriever.get_relevant_documents(query="modelo de decisão de saneamento e organização do processo cível", filter={"source_type": "modelo_juiz"}) if retriever else []
         modelo_texto_guia = docs_modelo_saneamento[0].page_content if docs_modelo_saneamento else "ERRO RAG: Modelo de saneamento não encontrado."
+
+        # Recuperar documentos do autor (do formulário/estado inicial) e do réu (do estado)
+        documentos_autor_lista = estado.get("dados_formulario_entrada", {}).get("documentos_autor", [])
+        documentos_autor_texto = formatar_lista_documentos_para_prompt(documentos_autor_lista, "Autor")
+        
+        documentos_reu_lista = estado.get("documentos_juntados_pelo_reu", [])
+        documentos_reu_texto = formatar_lista_documentos_para_prompt(documentos_reu_lista, "Réu")
+
         template_prompt = """
-        Você é um Juiz de Direito. Processe está na fase de saneamento.
+        Você é um Juiz de Direito. O processo está na fase de saneamento após a apresentação da contestação.
+        Analise a Petição Inicial, a Contestação e os documentos juntados por ambas as partes.
         **Processo ID:** {id_processo}
-        **Última manifestação das partes (Contestação):**
-        {ultima_peticao_partes}
-        **Contexto RAG do Caso (se necessário):**
+        
+        **Petição Inicial e Documentos do Autor (resumo/menção):**
+        (O conteúdo completo da Petição Inicial, que menciona os documentos do Autor, foi apresentado anteriormente no histórico)
+        {documentos_autor_info}
+
+        **Contestação do Réu e Documentos do Réu (para análise):**
+        {contestacao_e_docs_reu} 
+        (O conteúdo da Contestação está em 'contestacao_e_docs_reu'. Esta variável também pode conter a lista de documentos do réu ao final)
+        {documentos_reu_info}
+
+        **Contexto RAG Adicional do Caso (se necessário):**
         {contexto_fatos_caso_rag}
-        **Modelo/Guia de Decisão de Saneamento:**
+        
+        **Modelo/Guia de Decisão de Saneamento (use como referência):**
         {modelo_texto_guia}
-        **Histórico Processual:**
+        
+        **Histórico Processual Anterior:**
         {historico_formatado}
         ---
-        Redija a Decisão de Saneamento, definindo PONTOS CONTROVERTIDOS.
+        Tarefa: Redija a Decisão de Saneamento e Organização do Processo.
+        1. Verifique preliminares e condições da ação.
+        2. Delimite as questões de fato sobre as quais recairá a atividade probatória (PONTOS CONTROVERTIDOS).
+        3. Especifique os meios de prova admitidos.
+        4. Defina as questões de direito relevantes para a decisão do mérito.
+        5. Nunca designe audiência de instrução e julgamento, sempre determine que as parte
+        especifiquem as provas que pretendem produzir, advertindo que audiência não está 
+        prevista neste MVP
+        Certifique-se de que a decisão seja clara e objetiva.
         Decisão de Saneamento:
         """
         chain = criar_prompt_e_chain(template_prompt)
+        # 'documento_da_parte_para_analise' aqui é a contestação (que pode ou não já incluir a lista de docs do réu)
         documento_gerado = chain.invoke({
             "id_processo": id_processo,
-            "ultima_peticao_partes": documento_da_parte_para_analise,
+            "documentos_autor_info": documentos_autor_texto, # Passa a lista formatada
+            "contestacao_e_docs_reu": documento_da_parte_para_analise, # Contestação do agente_advogado_reu
+            "documentos_reu_info": documentos_reu_texto, # Passa a lista formatada
             "contexto_fatos_caso_rag": contexto_fatos_caso_rag_juiz,
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado
         })
-        proximo_ator_logico = ADVOGADO_AUTOR
-        try: # Extração de pontos controvertidos
+        proximo_ator_logico = ADVOGADO_AUTOR # Para manifestação sobre provas ou saneamento
+        try:
             inicio_pc = documento_gerado.upper().find("PONTOS CONTROVERTIDOS:")
             if inicio_pc != -1:
                 fim_pc = documento_gerado.find("\n\n", inicio_pc) 
                 if fim_pc == -1: fim_pc = len(documento_gerado)
                 pontos_controvertidos_definidos = documento_gerado[inicio_pc + len("PONTOS CONTROVERTIDOS:"):fim_pc].strip()
-            else: pontos_controvertidos_definidos = "Não extraído."
-        except Exception: pontos_controvertidos_definidos = "Erro extração."
-        print(f"[{JUIZ}-{etapa_atual_do_no}] Pontos Controvertidos: {pontos_controvertidos_definidos}")
+            else: pontos_controvertidos_definidos = "Não extraído explicitamente da decisão de saneamento."
+        except Exception: pontos_controvertidos_definidos = "Erro na extração dos pontos controvertidos."
+        print(f"[{JUIZ}-{etapa_atual_do_no}] Pontos Controvertidos Definidos/Extraídos: {pontos_controvertidos_definidos}")
+
 
     elif etapa_atual_do_no == ETAPA_SENTENCA:
-        docs_modelo_sentenca = retriever.get_relevant_documents(query="modelo de sentença cível", filter={"source_type": "modelo_juiz"}) if retriever else []
+        peticao_inicial_completa = "Petição Inicial não encontrada."
+        contestacao_completa = "Contestação não encontrada."
+        decisao_saneamento_completa = "Decisão de Saneamento não encontrada."
+        manifestacao_autor_sem_provas_texto = "Manifestação do Autor sobre provas não encontrada ou não ocorreu."
+        manifestacao_reu_sem_provas_texto = "Manifestação do Réu sobre provas não encontrada ou não ocorreu."
+        
+        historico_completo_para_sentenca = []
+        for item in estado.get("historico_completo", []):
+            historico_completo_para_sentenca.append(f"### Documento da Etapa: {item['etapa']} (Ator: {item['ator']})\n{item['documento']}\n---")
+            if item['etapa'] == ETAPA_PETICAO_INICIAL:
+                peticao_inicial_completa = item['documento']
+            elif item['etapa'] == ETAPA_CONTESTACAO:
+                contestacao_completa = item['documento']
+            elif item['etapa'] == ETAPA_DECISAO_SANEAMENTO:
+                decisao_saneamento_completa = item['documento']
+            elif item['etapa'] == ETAPA_MANIFESTACAO_SEM_PROVAS_AUTOR:
+                 manifestacao_autor_sem_provas_texto = item['documento']
+            elif item['etapa'] == ETAPA_MANIFESTACAO_SEM_PROVAS_REU:
+                 manifestacao_reu_sem_provas_texto = item['documento']
+
+        historico_formatado_completo_str = "\n".join(historico_completo_para_sentenca)
+
+        docs_modelo_sentenca = retriever.get_relevant_documents(query="modelo de sentença cível completa de mérito", filter={"source_type": "modelo_juiz"}) if retriever else []
         modelo_texto_guia = docs_modelo_sentenca[0].page_content if docs_modelo_sentenca else "ERRO RAG: Modelo de sentença não encontrado."
-        template_prompt = """
-        Você é um Juiz de Direito. O processo está concluso para sentença.
-        **Processo ID:** {id_processo}
-        **Última manifestação (Ex: Réu sem provas):**
-        {ultima_peticao_partes}
-        **Pontos Controvertidos definidos:**
-        {pontos_controvertidos_saneamento}
-        **Contexto RAG do Caso:**
-        {contexto_fatos_caso_rag}
-        **Modelo/Guia de Sentença:**
-        {modelo_texto_guia}
-        **Histórico Processual Completo:**
-        {historico_formatado}
+        
+        # Informações sobre documentos juntados (do estado)
+        documentos_autor_lista_estado = estado.get("dados_formulario_entrada", {}).get("documentos_autor", [])
+        documentos_autor_texto_formatado_estado = formatar_lista_documentos_para_prompt(documentos_autor_lista_estado, "Autor")
+        
+        documentos_reu_lista_estado = estado.get("documentos_juntados_pelo_reu", [])
+        documentos_reu_texto_formatado_estado = formatar_lista_documentos_para_prompt(documentos_reu_lista_estado, "Réu")
+
+        template_prompt_sentenca = f"""
+        Você é um Juiz de Direito e deve proferir a Sentença neste processo.
+        As partes (Autor e Réu) manifestaram desinteresse na produção de outras provas, requerendo o julgamento antecipado da lide.
+
+        **Processo ID:** {{id_processo}}
+
+        **Peças Processuais Principais e Histórico Completo (para sua análise):**
+        Petição Inicial:
+        {peticao_inicial_completa}
         ---
-        Redija a Sentença.
+        Documentos do Autor (listados na inicial ou formulário):
+        {documentos_autor_texto_formatado_estado}
+        ---
+        Contestação:
+        {contestacao_completa}
+        ---
+        Documentos do Réu (listados na contestação ou gerados):
+        {documentos_reu_texto_formatado_estado}
+        ---
+        Decisão de Saneamento (contém os pontos controvertidos):
+        {decisao_saneamento_completa}
+        ---
+        Manifestação do Autor sobre Provas:
+        {manifestacao_autor_sem_provas_texto}
+        ---
+        Manifestação do Réu sobre Provas:
+        {manifestacao_reu_sem_provas_texto}
+        ---
+        Histórico Processual Completo Adicional (se necessário):
+        {historico_formatado_completo_str} 
+        ---
+        **Modelo/Guia de Sentença (use como referência para estrutura e formalidades):**
+        {modelo_texto_guia}
+        ---
+        **Instruções para a Sentença:**
+        1.  Elabore um relatório conciso, mencionando as principais ocorrências do processo.
+        2.  Apresente a fundamentação, analisando as questões de fato e de direito, examinando as provas produzidas (documentais, no caso) em relação aos pontos controvertidos.
+        3.  Profira o dispositivo, julgando procedente, parcialmente procedente ou improcedente o pedido do Autor, de forma clara e precisa.
+        4.  Condene a parte vencida ao pagamento das custas processuais e honorários advocatícios (considere um percentual sobre o valor da causa ou condenação, ex: 10%).
+        5.  Conclua com local, data e assinatura.
+
         Sentença:
         """
-        chain = criar_prompt_e_chain(template_prompt)
-        documento_gerado = chain.invoke({
+        chain_sentenca = criar_prompt_e_chain(template_prompt_sentenca)
+        documento_gerado = chain_sentenca.invoke({
             "id_processo": id_processo,
-            "ultima_peticao_partes": documento_da_parte_para_analise,
-            "pontos_controvertidos_saneamento": estado.get("pontos_controvertidos_saneamento", "Não definidos."),
-            "contexto_fatos_caso_rag": contexto_fatos_caso_rag_juiz,
-            "modelo_texto_guia": modelo_texto_guia,
-            "historico_formatado": historico_formatado
+            # Os demais campos já estão no template string
         })
         proximo_ator_logico = ETAPA_FIM_PROCESSO
-    else:
-        print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {JUIZ} não implementada.")
-        documento_gerado = f"Conteúdo para {JUIZ} na etapa {etapa_atual_do_no}."
-        proximo_ator_logico = ETAPA_FIM_PROCESSO
+        # 'pontos_controvertidos_saneamento' não precisa ser modificado aqui, mas é usado no prompt.
 
     print(f"[{JUIZ}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
     novo_historico_item = {"etapa": etapa_atual_do_no, "ator": JUIZ, "documento": documento_gerado}
     historico_atualizado = estado.get("historico_completo", []) + [novo_historico_item]
     
-    estado_retorno = {k: v for k, v in estado.items()}
-    estado_retorno.update({
+    estado_retorno_parcial = {
         "nome_do_ultimo_no_executado": JUIZ,
         "etapa_concluida_pelo_ultimo_no": etapa_atual_do_no,
         "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
@@ -536,126 +625,219 @@ def agente_juiz(estado: EstadoProcessual) -> Dict[str, Any]:
         "historico_completo": historico_atualizado,
         "pontos_controvertidos_saneamento": pontos_controvertidos_definidos, # Atualiza
         "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
-    })
-    return estado_retorno
+    }
+    estado_final_retorno = {**estado, **estado_retorno_parcial}
+    return estado_final_retorno
+
 
 def agente_advogado_reu(estado: EstadoProcessual) -> Dict[str, Any]:
     etapa_atual_do_no = helper_logica_inicial_no(estado, ADVOGADO_REU)
     print(f"\n--- TURNO: {ADVOGADO_REU} (Executando Etapa: {etapa_atual_do_no}) ---")
-    # (Lógica de erro e inicialização de variáveis como antes)
+
     if etapa_atual_do_no == "ERRO_ETAPA_NAO_ENCONTRADA":
-        return {
+         return {
             "nome_do_ultimo_no_executado": ADVOGADO_REU, "etapa_concluida_pelo_ultimo_no": "ERRO_FLUXO_IRRECUPERAVEL",
             "proximo_ator_sugerido_pelo_ultimo_no": ETAPA_FIM_PROCESSO, "documento_gerado_na_etapa_recente": "Erro Réu.",
             "historico_completo": estado.get("historico_completo", []) + [{"etapa": "ERRO", "ator": ADVOGADO_REU, "documento": "Erro Réu."}],
-            "id_processo": estado.get("id_processo"), "retriever": estado.get("retriever"),
-            "dados_formulario_entrada": estado.get("dados_formulario_entrada")
+            **{k: v for k, v in estado.items() if k not in ["nome_do_ultimo_no_executado", "etapa_concluida_pelo_ultimo_no", "proximo_ator_sugerido_pelo_ultimo_no", "documento_gerado_na_etapa_recente", "historico_completo"]}
         }
 
-    documento_gerado = f"Documento padrão para {ADVOGADO_REU} na etapa {etapa_atual_do_no} não gerado."
-    proximo_ator_logico = JUIZ
+    documento_gerado_principal = f"Documento padrão para {ADVOGADO_REU} na etapa {etapa_atual_do_no} não gerado."
+    proximo_ator_logico = JUIZ # Padrão
     retriever = estado["retriever"]
     id_processo = estado["id_processo"]
-    # dados_formulario = estado.get("dados_formulario_entrada", {})
     historico_formatado = "\n".join([f"- Etapa: {item['etapa']}, Ator: {item['ator']}:\n  Documento: {item['documento'][:150]}..." for item in estado.get("historico_completo", [])])
     if not historico_formatado: historico_formatado = "Histórico não disponível."
-    documento_relevante_anterior = estado.get("documento_gerado_na_etapa_recente", "Nenhum documento recente.")
+    # O 'documento_relevante_anterior' é o despacho do juiz que ordenou a citação ou a manifestação do autor
+    documento_relevante_anterior = estado.get("documento_gerado_na_etapa_recente", "Nenhum documento anterior relevante informado.")
     
-    # Contexto RAG (fatos do caso sob perspectiva da defesa)
-    # query_fatos_caso_reu = f"Resumo dos fatos e principais pontos do processo {id_processo} sob a perspectiva da defesa"
-    # docs_fatos_caso_reu = retriever.get_relevant_documents(query=query_fatos_caso_reu) if retriever else []
-    # contexto_fatos_caso_rag_reu = "\n".join([doc.page_content for doc in docs_fatos_caso_reu]) if docs_fatos_caso_reu else "Nenhum detalhe factual do RAG para a defesa."
-    contexto_fatos_caso_rag_reu = "Contexto RAG do caso para o réu (simplificado)." # Placeholder
+    contexto_fatos_caso_rag_reu = "Contexto RAG do caso para o réu (simplificado)." 
+    lista_documentos_juntados_pelo_reu_final = [] # Inicializa
 
     if etapa_atual_do_no == ETAPA_CONTESTACAO:
-        peticao_inicial_autor = "Petição Inicial não encontrada no histórico para contestação." 
-        for item in reversed(estado.get("historico_completo", [])): # Busca a PI no histórico
-            if item["etapa"] == ETAPA_PETICAO_INICIAL and item["ator"] == ADVOGADO_AUTOR:
-                peticao_inicial_autor = item["documento"]
+        peticao_inicial_autor_texto_completo = "Petição Inicial do Autor não encontrada no histórico para contestação." 
+        # Tenta buscar a Petição Inicial completa do histórico
+        for item_hist in reversed(estado.get("historico_completo", [])):
+            if item_hist["etapa"] == ETAPA_PETICAO_INICIAL and item_hist["ator"] == ADVOGADO_AUTOR:
+                peticao_inicial_autor_texto_completo = item_hist["documento"]
                 break
         
-        docs_modelo_contestacao = retriever.get_relevant_documents(query="modelo de contestação cível completa", filter={"source_type": "modelo_peticao"}) if retriever else []
+        docs_modelo_contestacao = retriever.get_relevant_documents(query="modelo de contestação cível completa e bem fundamentada", filter={"source_type": "modelo_peticao"}) if retriever else []
         modelo_texto_guia = docs_modelo_contestacao[0].page_content if docs_modelo_contestacao else "ERRO RAG: Modelo de contestação não encontrado."
-        template_prompt = """
-        Você é um Advogado do Réu. Elabore uma Contestação.
+        
+        template_prompt_contestacao = """
+        Você é um Advogado do Réu experiente. Sua tarefa é elaborar uma Contestação completa e robusta.
         **Processo ID:** {id_processo}
-        **Despacho Judicial Recebido (citação):**
+        
+        **Despacho Judicial Recebido (determinando a citação/contestação):**
         {despacho_judicial}
-        **Petição Inicial do Autor (a ser contestada):**
+        
+        **Petição Inicial do Autor (que originou esta contestação e pode mencionar documentos juntados pelo Autor):**
         {peticao_inicial_autor}
-        **Contexto RAG dos Fatos (perspectiva da defesa, se houver):**
+        
+        **Contexto Adicional dos Fatos (perspectiva da defesa, se houver, via RAG):**
         {contexto_fatos_caso_rag}
-        **Modelo/Guia de Contestação:**
+        
+        **Modelo/Guia de Contestação (RAG - use para estrutura, formalidades e teses defensivas comuns):**
         {modelo_texto_guia}
-        **Histórico Processual:**
+        
+        **Histórico Processual Anterior:**
         {historico_formatado}
         ---
-        Redija a Contestação completa.
+        Instruções para a Contestação:
+        1. Analise cuidadosamente a Petição Inicial do Autor.
+        2. Apresente as defesas processuais (preliminares), se houver (ex: incompetência, inépcia da inicial).
+        3. No mérito, impugne especificamente os fatos narrados pelo Autor e os fundamentos jurídicos apresentados.
+        4. Apresente a versão dos fatos sob a ótica do Réu e a fundamentação jurídica que ampara sua defesa.
+        5. Formule os pedidos da contestação (ex: acolhimento das preliminares, improcedência dos pedidos do autor, condenação em custas e honorários).
+        6. A contestação deve ser bem estruturada (endereçamento, qualificação das partes se necessário reiterar, fatos, preliminares, mérito, pedidos, fecho).
+
         Contestação:
         """
-        chain = criar_prompt_e_chain(template_prompt)
-        documento_gerado = chain.invoke({
+        chain_contestacao = criar_prompt_e_chain(template_prompt_contestacao)
+        documento_gerado_principal = chain_contestacao.invoke({
             "id_processo": id_processo,
             "despacho_judicial": documento_relevante_anterior,
-            "peticao_inicial_autor": peticao_inicial_autor,
+            "peticao_inicial_autor": peticao_inicial_autor_texto_completo,
             "contexto_fatos_caso_rag": contexto_fatos_caso_rag_reu,
             "modelo_texto_guia": modelo_texto_guia,
             "historico_formatado": historico_formatado
         })
+
+        # --- SEGUNDA CHAMADA LLM: Gerar lista de documentos do Réu ---
+        print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Contestação gerada. Solicitando lista de documentos do Réu...")
+        fatos_gerais_caso = estado.get("dados_formulario_entrada", {}).get("fatos", "Fatos do caso não disponíveis.")
+        
+        prompt_docs_reu_template = """
+        Com base na Petição Inicial do Autor, na Contestação do Réu recém-elaborada, e nos fatos gerais do caso, você deve listar de 2 a 4 documentos principais que o Réu provavelmente juntaria para dar suporte à sua defesa.
+        Para cada documento, forneça o tipo e uma descrição MUITO SUCINTA (1 frase, máximo 20 palavras).
+
+        Petição Inicial do Autor (Resumo/Contexto - o Réu teve acesso completo a ela):
+        {peticao_inicial_autor_resumo} 
+
+        Contestação do Réu (Completa - elaborada para este caso):
+        {contestacao_texto_completa}
+
+        Fatos Gerais do Caso (fornecidos no início da simulação):
+        {fatos_do_caso}
+
+        Sua resposta DEVE SER uma lista de strings, onde cada string representa um documento no formato: "Tipo do Documento: Descrição sucinta."
+        Exemplo de formato de saída:
+        Documento de Identidade do Réu: RG e CPF para qualificação nos autos.
+        Contrato de Locação: Cópia do contrato que estabelece as obrigações das partes.
+        Comprovantes de Pagamento: Recibos dos aluguéis dos meses X, Y e Z.
+
+        Liste os documentos do Réu:
+        """
+        # Usaremos StrOutputParser e depois parsearemos a string.
+        # Para JSON, precisaríamos de JsonOutputParser e um prompt que explicitamente peça JSON.
+        
+        chain_docs_reu = criar_prompt_e_chain(prompt_docs_reu_template)
+        # Para o resumo da PI, podemos pegar os primeiros N caracteres.
+        pi_resumo_para_prompt_docs = peticao_inicial_autor_texto_completo[:1000] + "..." if len(peticao_inicial_autor_texto_completo) > 1000 else peticao_inicial_autor_texto_completo
+        
+        resposta_docs_reu_str = chain_docs_reu.invoke({
+            "peticao_inicial_autor_resumo": pi_resumo_para_prompt_docs,
+            "contestacao_texto_completa": documento_gerado_principal,
+            "fatos_do_caso": fatos_gerais_caso
+        })
+        
+        # Parsear a string da resposta para uma lista de dicts
+        lista_documentos_juntados_pelo_reu_final = []
+        if resposta_docs_reu_str and resposta_docs_reu_str.strip():
+            linhas_docs = resposta_docs_reu_str.strip().split('\n')
+            for linha in linhas_docs:
+                if ':' in linha:
+                    partes = linha.split(':', 1)
+                    tipo_doc = partes[0].strip()
+                    desc_doc = partes[1].strip()
+                    if tipo_doc and desc_doc: # Só adiciona se ambos existirem
+                         lista_documentos_juntados_pelo_reu_final.append({"tipo": tipo_doc, "descricao": desc_doc})
+        
+        if not lista_documentos_juntados_pelo_reu_final:
+            print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Não foi possível gerar ou parsear a lista de documentos do Réu.")
+            lista_documentos_juntados_pelo_reu_final = [{"tipo": "Informação", "descricao": "A IA não especificou documentos para o réu nesta etapa ou houve falha no parsing."}]
+        else:
+            print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Documentos do Réu gerados: {lista_documentos_juntados_pelo_reu_final}")
+
+        # Anexar a lista de documentos ao final da contestação (opcional, para o histórico)
+        documentos_reu_texto_para_anexar = formatar_lista_documentos_para_prompt(lista_documentos_juntados_pelo_reu_final, "Réu")
+        documento_gerado_principal += f"\n\n---\n{documentos_reu_texto_para_anexar}"
         proximo_ator_logico = JUIZ
+
 
     elif etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_REU:
-        manifestacao_autor_sem_provas_doc = documento_relevante_anterior
-        decisao_saneamento_texto = "Decisão de Saneamento não encontrada."
-        if estado.get("pontos_controvertidos_saneamento"):
-             decisao_saneamento_texto = f"Decisão de Saneamento anterior definiu: {estado['pontos_controvertidos_saneamento']}"
+        decisao_saneamento_juiz = "Decisão de Saneamento não encontrada no histórico."
+        manifestacao_autor_recente = estado.get("documento_gerado_na_etapa_recente", "Manifestação do Autor não encontrada no estado.")
+        pontos_controvertidos = estado.get("pontos_controvertidos_saneamento", "Pontos controvertidos não definidos.")
+        historico_completo_formatado_para_prompt = "\n".join([f"### Documento da Etapa: {item['etapa']} (Ator: {item['ator']})\n{item['documento']}\n---" for item in estado.get("historico_completo", [])])
+
+
+        # Busca a decisão de saneamento no histórico para melhor contexto
+        for item_hist in reversed(estado.get("historico_completo", [])):
+            if item_hist["etapa"] == ETAPA_DECISAO_SANEAMENTO and item_hist["ator"] == JUIZ:
+                decisao_saneamento_juiz = item_hist["documento"]
+                break
         
-        docs_modelo_manifest_reu = retriever.get_relevant_documents(query="modelo de petição réu sem mais provas", filter={"source_type": "modelo_peticao"}) if retriever else []
-        modelo_texto_guia = docs_modelo_manifest_reu[0].page_content if docs_modelo_manifest_reu else "ERRO RAG: Modelo manifestação réu sem provas não encontrado."
-        template_prompt = """
-        Você é o Advogado do Réu. O Autor já se manifestou sobre não ter mais provas.
-        **Processo ID:** {id_processo}
-        **Decisão de Saneamento (resumo):**
-        {decisao_saneamento_texto}
-        **Manifestação do Autor sobre não ter mais provas:**
-        {manifestacao_autor_sem_provas_doc}
-        **Modelo/Guia de Manifestação do Réu:**
-        {modelo_texto_guia}
-        **Histórico Processual:**
-        {historico_formatado}
-        ---
-        Redija a Petição de Manifestação do Réu (informando não ter mais provas).
-        Manifestação do Réu:
+        template_prompt_manifestacao_reu = f"""
+        Você é o Advogado do Réu. O Juiz proferiu a Decisão de Saneamento e o Autor já se manifestou informando não ter mais provas a produzir.
+        Seu cliente (Réu) também informou que não possui mais provas a produzir e deseja o julgamento antecipado da lide.
+
+        **Processo ID:** {{id_processo}}
+
+        **Decisão de Saneamento do Juiz (para referência):**
+        {decisao_saneamento_juiz}
+
+        **Manifestação do Autor Recebida:**
+        {manifestacao_autor_recente}
+
+        **Pontos Controvertidos Fixados na Decisão de Saneamento:**
+        {pontos_controvertidos}
+
+        **Histórico Processual Anterior (para contexto):**
+        {historico_completo_formatado_para_prompt}
+
+        **Instruções:**
+        1. Redija uma petição de "Manifestação Sobre Provas (Réu)".
+        2. Na petição, declare que o Réu também não tem outras provas a produzir, além daquelas já constantes nos autos (documentais, incluindo as da contestação).
+        3. Requeira o julgamento do processo no estado em que se encontra (julgamento antecipado do mérito), reiterando o pedido do Autor nesse sentido.
+        4. Mantenha a formalidade e praxe forense. Conclua com data e assinatura do advogado.
+
+        Manifestação Sobre Provas (Réu):
         """
-        chain = criar_prompt_e_chain(template_prompt)
-        documento_gerado = chain.invoke({
+        chain_manifestacao_reu = criar_prompt_e_chain(template_prompt_manifestacao_reu)
+        documento_gerado_principal = chain_manifestacao_reu.invoke({
             "id_processo": id_processo,
-            "decisao_saneamento_texto": decisao_saneamento_texto,
-            "manifestacao_autor_sem_provas_doc": manifestacao_autor_sem_provas_doc,
-            "modelo_texto_guia": modelo_texto_guia,
-            "historico_formatado": historico_formatado
+            # "historico_formatado": historico_formatado # Já incluído
         })
         proximo_ator_logico = JUIZ
+        # A flag "manifestacao_reu_sem_provas" já é atualizada no bloco de retorno do estado.
+        # Não há "lista_documentos_juntados_pelo_reu_final" nesta etapa, pois é só manifestação.
+        # Se precisar garantir que não sobrescreva, pode-se fazer:
+        lista_documentos_juntados_pelo_reu_final = estado.get("documentos_juntados_pelo_reu", [])
+        
     else:
         print(f"AVISO: Lógica para etapa '{etapa_atual_do_no}' do {ADVOGADO_REU} não implementada.")
-        documento_gerado = f"Conteúdo para {ADVOGADO_REU} na etapa {etapa_atual_do_no}."
+        documento_gerado_principal = f"Conteúdo para {ADVOGADO_REU} na etapa {etapa_atual_do_no}."
         proximo_ator_logico = JUIZ
 
-    print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Documento Gerado (trecho): {documento_gerado[:250]}...")
-    novo_historico_item = {"etapa": etapa_atual_do_no, "ator": ADVOGADO_REU, "documento": documento_gerado}
+    print(f"[{ADVOGADO_REU}-{etapa_atual_do_no}] Documento Principal Gerado (trecho): {documento_gerado_principal[:250]}...")
+    
+    novo_historico_item = {"etapa": etapa_atual_do_no, "ator": ADVOGADO_REU, "documento": documento_gerado_principal}
     historico_atualizado = estado.get("historico_completo", []) + [novo_historico_item]
 
-    estado_retorno = {k: v for k, v in estado.items()}
-    estado_retorno.update({
+    estado_retorno_parcial = {
         "nome_do_ultimo_no_executado": ADVOGADO_REU,
         "etapa_concluida_pelo_ultimo_no": etapa_atual_do_no,
         "proximo_ator_sugerido_pelo_ultimo_no": proximo_ator_logico,
-        "documento_gerado_na_etapa_recente": documento_gerado,
+        "documento_gerado_na_etapa_recente": documento_gerado_principal, # Contestação + lista de docs
         "historico_completo": historico_atualizado,
         "manifestacao_reu_sem_provas": estado.get("manifestacao_reu_sem_provas", False) or (etapa_atual_do_no == ETAPA_MANIFESTACAO_SEM_PROVAS_REU),
         "etapa_a_ser_executada_neste_turno": etapa_atual_do_no,
-    })
-    return estado_retorno
+        "documentos_juntados_pelo_reu": lista_documentos_juntados_pelo_reu_final # Salva a lista estruturada no estado
+    }
+    estado_final_retorno = {**estado, **estado_retorno_parcial}
+    return estado_final_retorno
 
 # --- 8. Construção do Grafo LangGraph ---
 workflow = StateGraph(EstadoProcessual)
@@ -672,30 +854,96 @@ app = workflow.compile()
 # --- 9. Interface Streamlit e Lógica de Execução ---
 
 # --- Constantes e Funções da UI Streamlit ---
-FORM_STEPS = ["autor", "reu", "natureza_acao", "fatos", "direito", "pedidos", "revisar_e_simular"]
+# MODIFICADO: Nova ordem e nova etapa
+FORM_STEPS = [
+    "autor", 
+    "reu", 
+    "fatos", 
+    "direito", 
+    "pedidos", 
+    "natureza_acao",      # Movido para após "pedidos"
+    "documentos_autor",   # Nova etapa adicionada
+    "revisar_e_simular"
+]
+
+# NOVO: Lista de tipos de documentos
+TIPOS_DOCUMENTOS_COMUNS = [
+    "Nenhum (Apenas Descrição Factual)", # Opção para quando não há um "documento" formal
+    "Contrato (Partes, Objeto, Data)", 
+    "Termo de Declaração (Declarante, Data, Fatos Declarados)", 
+    "Laudo Pericial/Técnico (Perito, Objeto, Conclusões, Data)", 
+    "Procuração Ad Judicia", 
+    "Comprovante de Residência (Recente)", 
+    "Documento de Identidade (RG/CPF/CNH do Autor)", 
+    "Documento de Identidade (RG/CPF/CNH do Réu - se souber)",
+    "CNPJ e Contrato Social (Pessoa Jurídica)",
+    "Prints de Conversa (WhatsApp, E-mail, etc. - Datas, Interlocutores, Conteúdo Relevante)", 
+    "Ata Notarial (Fatos Constatados, Data)", 
+    "Fotografias/Vídeos (Descrição do Conteúdo, Data)",
+    "Notas Fiscais/Recibos (Emitente, Destinatário, Valor, Data, Produto/Serviço)", 
+    "Extratos Bancários (Período, Transações Relevantes)", 
+    "Prontuário Médico/Atestado (Paciente, Médico, Data, Informações Relevantes)",
+    "Boletim de Ocorrência (Fatos Narrados, Data, Envolvidos)", 
+    "Certidão (Casamento, Nascimento, Óbito, Imóvel, etc.)", 
+    "Notificação Extrajudicial (Enviada, Recebida, Conteúdo, Data)",
+    "Outro (Especificar)"
+]
+
 
 def inicializar_estado_formulario():
     if 'current_form_step_index' not in st.session_state:
         st.session_state.current_form_step_index = 0
+    
+    # Campos que devem ser inicializados/resetados para um novo formulário
+    default_form_data = {
+        "id_processo": f"caso_sim_{int(time.time())}",
+        "qualificacao_autor": "", "qualificacao_reu": "", 
+        "fatos": "", "fundamentacao_juridica": "", "pedidos": "",
+        "natureza_acao": "", 
+        "documentos_autor": [] # Lista para armazenar os documentos do autor
+    }
+    default_ia_flags = {key: False for key in default_form_data.keys()}
+    default_ia_flags["documentos_autor_descricoes"] = {} # Flags para descrições individuais
+
     if 'form_data' not in st.session_state:
-        st.session_state.form_data = {
-            "id_processo": f"caso_sim_{int(time.time())}",
-            "qualificacao_autor": "", "qualificacao_reu": "", "natureza_acao": "",
-            "fatos": "", "fundamentacao_juridica": "", "pedidos": ""
-        }
+        st.session_state.form_data = default_form_data.copy()
+    else: # Garante que todos os campos existem, útil se novos campos são adicionados posteriormente
+        for key, value in default_form_data.items():
+            if key not in st.session_state.form_data:
+                st.session_state.form_data[key] = value
+        if "documentos_autor" not in st.session_state.form_data: # Caso específico para a lista
+             st.session_state.form_data["documentos_autor"] = []
+
+
     if 'ia_generated_content_flags' not in st.session_state:
-        # Inicializa flags para todos os campos em form_data, não apenas os de texto principais
-        st.session_state.ia_generated_content_flags = {key: False for key in st.session_state.form_data.keys()}
+        st.session_state.ia_generated_content_flags = default_ia_flags.copy()
+    else:
+        for key, value in default_ia_flags.items():
+            if key not in st.session_state.ia_generated_content_flags:
+                st.session_state.ia_generated_content_flags[key] = value
+
+
+    if 'num_documentos_autor' not in st.session_state: # Para a UI de documentos_autor
+        st.session_state.num_documentos_autor = 0 
+        # Será ajustado para 1 na primeira vez que exibir_formulario_documentos_autor for chamado, se a lista estiver vazia.
+
+    # Outros estados da UI
     if 'simulation_running' not in st.session_state:
         st.session_state.simulation_running = False
-    if 'simulation_results' not in st.session_state: # Garantir que simulation_results sempre exista
+    if 'simulation_results' not in st.session_state:
         st.session_state.simulation_results = {}
-    if 'doc_visualizado' not in st.session_state: # Para a exibição de documentos
+    if 'doc_visualizado' not in st.session_state:
         st.session_state.doc_visualizado = None
     if 'doc_visualizado_titulo' not in st.session_state:
         st.session_state.doc_visualizado_titulo = ""
 
-def gerar_conteudo_com_ia(prompt_template_str: str, campos_prompt: dict, campo_formulario_display: str, chave_estado: str):
+def gerar_conteudo_com_ia(prompt_template_str: str, campos_prompt: dict, campo_formulario_display: str, chave_estado: str, sub_chave_lista: Union[str, int, None] = None, indice_lista: Union[int, None] = None):
+    """
+    Gera conteúdo com IA.
+    Se sub_chave_lista e indice_lista são fornecidos, atualiza um item dentro de uma lista de dicionários em form_data.
+    Ex: form_data['documentos_autor'][indice_lista][sub_chave_lista] = conteudo_gerado
+    Caso contrário, atualiza form_data[chave_estado] diretamente.
+    """
     if not GOOGLE_API_KEY:
         st.error("A chave API do Google não foi configurada. Não é possível usar a IA.")
         return
@@ -704,22 +952,35 @@ def gerar_conteudo_com_ia(prompt_template_str: str, campos_prompt: dict, campo_f
             prompt = ChatPromptTemplate.from_template(prompt_template_str)
             chain = prompt | llm | StrOutputParser()
             conteudo_gerado = chain.invoke(campos_prompt)
-            st.session_state.form_data[chave_estado] = conteudo_gerado
-            st.session_state.ia_generated_content_flags[chave_estado] = True
-        st.rerun() # Usar st.rerun() em vez de st.experimental_rerun()
+            
+            if sub_chave_lista is not None and indice_lista is not None and chave_estado == "documentos_autor":
+                # Garante que a lista e o dicionário no índice existem
+                while len(st.session_state.form_data["documentos_autor"]) <= indice_lista:
+                    st.session_state.form_data["documentos_autor"].append({})
+                st.session_state.form_data["documentos_autor"][indice_lista][sub_chave_lista] = conteudo_gerado
+                st.session_state.ia_generated_content_flags.setdefault("documentos_autor_descricoes", {})[f"doc_{indice_lista}"] = True
+            else:
+                st.session_state.form_data[chave_estado] = conteudo_gerado
+                st.session_state.ia_generated_content_flags[chave_estado] = True
+        st.rerun()
     except Exception as e:
-        st.error(f"Erro ao gerar conteúdo com IA: {e}")
+        st.error(f"Erro ao gerar conteúdo com IA para '{campo_formulario_display}': {e}")
+
+# --- Funções de Exibição dos Formulários (Atualizadas e Novas) ---
 
 def exibir_formulario_qualificacao_autor():
-    st.subheader("1. Qualificação do Autor")
+    idx_etapa = FORM_STEPS.index("autor")
+    st.subheader(f"{idx_etapa + 1}. Qualificação do Autor")
+    # ... (restante da função como na última versão fornecida, apenas ajustando o botão "Próximo" se necessário)
+    # O "Próximo" de "autor" vai para "reu", que é o próximo em FORM_STEPS, então a lógica de +=1 no índice funciona.
     with st.form("form_autor"):
         st.session_state.form_data["qualificacao_autor"] = st.text_area(
             "Qualificação Completa do Autor", value=st.session_state.form_data.get("qualificacao_autor", ""),
-            height=150, key="autor_q_text_area",
+            height=150, key="autor_q_text_area_final",
             help="Ex: Nome completo, nacionalidade, estado civil, profissão, RG, CPF, endereço com CEP, e-mail."
         )
         col1, col2 = st.columns([1,5])
-        with col1: submetido = st.form_submit_button("Próximo ➡")
+        with col1: submetido = st.form_submit_button("Próximo (Réu) ➡")
         with col2:
             if st.form_submit_button("Autopreencher com IA (Dados Fictícios)"):
                 prompt_str = "Gere uma qualificação completa fictícia para um autor de uma ação judicial (nome completo, nacionalidade, estado civil, profissão, RG, CPF, endereço completo com CEP e e-mail)."
@@ -729,25 +990,27 @@ def exibir_formulario_qualificacao_autor():
             st.caption("📝 Conteúdo preenchido por IA. Revise e ajuste.")
         
         if submetido:
-            if st.session_state.form_data.get("qualificacao_autor","").strip(): # Verificar se não está vazio ou só espaços
+            if st.session_state.form_data.get("qualificacao_autor","").strip():
                 st.session_state.current_form_step_index += 1
                 st.rerun()
             else: st.warning("Preencha a qualificação do autor.")
 
 def exibir_formulario_qualificacao_reu():
-    st.subheader("2. Qualificação do Réu")
+    idx_etapa = FORM_STEPS.index("reu")
+    st.subheader(f"{idx_etapa + 1}. Qualificação do Réu")
+    # O "Voltar" de "reu" vai para "autor". O "Próximo" vai para "fatos".
     with st.form("form_reu"):
         st.session_state.form_data["qualificacao_reu"] = st.text_area(
             "Qualificação Completa do Réu", value=st.session_state.form_data.get("qualificacao_reu", ""),
-            height=150, key="reu_q_text_area",
+            height=150, key="reu_q_text_area_final",
             help="Ex: Nome/Razão Social, CPF/CNPJ, endereço com CEP, e-mail (se pessoa física ou jurídica)."
         )
-        col1, col2, col3 = st.columns([1,1,4]) # Ajustar proporção se necessário
+        col1, col2, col3 = st.columns([1,1,4]) 
         with col1:
-            if st.form_submit_button("⬅ Voltar"):
-                st.session_state.current_form_step_index -=1
+            if st.form_submit_button("⬅ Voltar (Autor)"):
+                st.session_state.current_form_step_index = FORM_STEPS.index("autor")
                 st.rerun()
-        with col2: submetido = st.form_submit_button("Próximo ➡")
+        with col2: submetido = st.form_submit_button("Próximo (Fatos) ➡")
         with col3:
             if st.form_submit_button("Autopreencher com IA (Dados Fictícios)"):
                 prompt_str = "Gere uma qualificação completa fictícia para um réu (pessoa física OU jurídica) em uma ação judicial (nome/razão social, CPF/CNPJ, endereço com CEP, e-mail)."
@@ -762,56 +1025,29 @@ def exibir_formulario_qualificacao_reu():
                 st.rerun()
             else: st.warning("Preencha a qualificação do réu.")
 
-def exibir_formulario_natureza_acao():
-    st.subheader("3. Natureza da Ação")
-    with st.form("form_natureza"):
-        st.session_state.form_data["natureza_acao"] = st.text_input(
-            "Natureza da Ação",
-            value=st.session_state.form_data.get("natureza_acao", ""), key="natureza_acao_text_input",
-            help="Ex: Ação de Cobrança, Ação de Indenização por Danos Morais, Ação Revisional de Contrato."
-        )
-        col1, col2, col3 = st.columns([1,1,4])
-        with col1:
-            if st.form_submit_button("⬅ Voltar"):
-                st.session_state.current_form_step_index -=1
-                st.rerun()
-        with col2: submetido = st.form_submit_button("Próximo ➡")
-        with col3:
-            if st.form_submit_button("Sugerir com IA (com base nos fatos, se preenchidos)"):
-                fatos_previos = st.session_state.form_data.get("fatos","")[:300] # Pega um trecho dos fatos
-                prompt_str = ("Com base nos seguintes fatos (se informados): '{fatos_previos}', sugira um nome conciso e técnico para a natureza de uma ação judicial. "
-                              "Se os fatos não forem claros, sugira um exemplo comum como 'Ação de Indenização'. Exemplos de nomes: Ação de Cobrança, Ação Declaratória de Inexistência de Débito, Ação de Indenização por Danos Morais e Materiais.\nNatureza Sugerida:")
-                gerar_conteudo_com_ia(prompt_str, {"fatos_previos": fatos_previos or "Não informado"}, "Natureza da Ação", "natureza_acao")
-        
-        if st.session_state.ia_generated_content_flags.get("natureza_acao"):
-            st.caption("📝 Conteúdo sugerido por IA. Revise.")
-
-        if submetido:
-            if st.session_state.form_data.get("natureza_acao","").strip():
-                st.session_state.current_form_step_index += 1
-                st.rerun()
-            else: st.warning("Defina a natureza da ação.")
-
 def exibir_formulario_fatos():
-    st.subheader("4. Breve Descrição dos Fatos")
+    idx_etapa = FORM_STEPS.index("fatos")
+    st.subheader(f"{idx_etapa + 1}. Descrição dos Fatos") # Título atualizado
+    # O "Voltar" de "fatos" vai para "reu". O "Próximo" vai para "direito".
     with st.form("form_fatos"):
         st.session_state.form_data["fatos"] = st.text_area(
             "Descreva os Fatos de forma clara e cronológica", value=st.session_state.form_data.get("fatos", ""),
-            height=300, key="fatos_text_area",
+            height=300, key="fatos_text_area_final",
             help="Relate os acontecimentos que deram origem à disputa, incluindo datas (mesmo que aproximadas), locais e pessoas envolvidas."
         )
-        col1, col2, col3 = st.columns([1,1,4])
+        col1, col2, col3 = st.columns([1,1,3])
         with col1:
-            if st.form_submit_button("⬅ Voltar"):
-                st.session_state.current_form_step_index -=1
+            if st.form_submit_button("⬅ Voltar (Réu)"):
+                st.session_state.current_form_step_index = FORM_STEPS.index("reu")
                 st.rerun()
-        with col2: submetido = st.form_submit_button("Próximo ➡")
+        with col2: submetido = st.form_submit_button("Próximo (Direito) ➡")
         with col3:
-            if st.form_submit_button("Gerar Fatos com IA (baseado na natureza da ação)"):
-                natureza_acao_informada = st.session_state.form_data.get("natureza_acao","Ação não especificada")
-                prompt_str = ("Para uma Ação de '{natureza_acao_informada}', elabore uma narrativa de fatos (2-4 parágrafos) que levaram à disputa. "
+            if st.form_submit_button("Gerar Fatos com IA (para um caso fictício)"):
+                # Natureza da ação ainda não foi definida, então o prompt é mais genérico ou pode pedir um tipo de caso.
+                # Para simplificar, vamos manter um gerador de fatos mais genérico.
+                prompt_str = ("Elabore uma narrativa de fatos (2-4 parágrafos) para um caso judicial cível fictício comum (ex: cobrança, dano moral simples, acidente de trânsito leve). "
                               "Inclua elementos essenciais, datas aproximadas fictícias (ex: 'em meados de janeiro de 2023'), e o problema central. Use 'o Autor' e 'o Réu' para se referir às partes.\nDescrição dos Fatos:")
-                gerar_conteudo_com_ia(prompt_str, {"natureza_acao_informada": natureza_acao_informada}, "Descrição dos Fatos", "fatos")
+                gerar_conteudo_com_ia(prompt_str, {}, "Descrição dos Fatos", "fatos")
 
         if st.session_state.ia_generated_content_flags.get("fatos"):
             st.caption("📝 Conteúdo gerado por IA. Revise e detalhe conforme o caso real.")
@@ -823,28 +1059,30 @@ def exibir_formulario_fatos():
             else: st.warning("Descreva os fatos.")
 
 def exibir_formulario_direito():
-    st.subheader("5. Fundamentação Jurídica (Do Direito)")
+    idx_etapa = FORM_STEPS.index("direito")
+    st.subheader(f"{idx_etapa + 1}. Fundamentação Jurídica (Do Direito)")
+    # O "Voltar" de "direito" vai para "fatos". O "Próximo" vai para "pedidos".
     with st.form("form_direito"):
         st.session_state.form_data["fundamentacao_juridica"] = st.text_area(
             "Insira a fundamentação jurídica aplicável ao caso", value=st.session_state.form_data.get("fundamentacao_juridica", ""),
-            height=300, key="direito_text_area",
+            height=300, key="direito_text_area_final",
             help="Cite os artigos de lei, súmulas, jurisprudência e princípios jurídicos que amparam a sua pretensão, explicando a conexão com os fatos."
         )
-        col1, col2, col3 = st.columns([1,1,4])
+        col1, col2, col3 = st.columns([1,1,3])
         with col1:
-            if st.form_submit_button("⬅ Voltar"):
-                st.session_state.current_form_step_index -=1
+            if st.form_submit_button("⬅ Voltar (Fatos)"):
+                st.session_state.current_form_step_index = FORM_STEPS.index("fatos")
                 st.rerun()
-        with col2: submetido = st.form_submit_button("Próximo ➡")
+        with col2: submetido = st.form_submit_button("Próximo (Pedidos) ➡")
         with col3:
-            if st.form_submit_button("Sugerir Fundamentação com IA (baseado nos fatos e natureza)"):
-                fatos_informados = st.session_state.form_data.get("fatos","Fatos não informados.")
-                natureza_acao_informada = st.session_state.form_data.get("natureza_acao","Natureza da ação não informada.")
-                prompt_str = ("Analise os Fatos: \n{fatos_informados}\n\nE a Natureza da Ação: '{natureza_acao_informada}'.\n"
+            if st.form_submit_button("Sugerir Fundamentação com IA (baseado nos fatos)"):
+                fatos_informados = st.session_state.form_data.get("fatos","Fatos não informados para contextualizar a fundamentação do direito.")
+                # Natureza da ação ainda não foi definida aqui.
+                prompt_str = ("Analise os Fatos: \n{fatos_informados}\n\n"
                               "Com base nisso, elabore uma seção 'DO DIREITO' para uma petição inicial. "
-                              "Cite artigos de lei relevantes (ex: Código Civil, CDC, Constituição Federal), e explique brevemente como se aplicam aos fatos para justificar os pedidos que seriam feitos. "
+                              "Sugira institutos jurídicos aplicáveis, cite artigos de lei relevantes (ex: Código Civil, CDC, Constituição Federal), e explique brevemente como se aplicam aos fatos para justificar os pedidos que seriam feitos. "
                               "Estruture em parágrafos.\nFundamentação Jurídica Sugerida:")
-                gerar_conteudo_com_ia(prompt_str, {"fatos_informados": fatos_informados, "natureza_acao_informada": natureza_acao_informada}, "Fundamentação Jurídica", "fundamentacao_juridica")
+                gerar_conteudo_com_ia(prompt_str, {"fatos_informados": fatos_informados}, "Fundamentação Jurídica", "fundamentacao_juridica")
         
         if st.session_state.ia_generated_content_flags.get("fundamentacao_juridica"):
             st.caption("📝 Conteúdo sugerido por IA. Revise, valide e complemente com referências específicas.")
@@ -856,29 +1094,30 @@ def exibir_formulario_direito():
             else: st.warning("Insira a fundamentação jurídica.")
 
 def exibir_formulario_pedidos():
-    st.subheader("6. Pedidos")
+    idx_etapa = FORM_STEPS.index("pedidos")
+    st.subheader(f"{idx_etapa + 1}. Pedidos")
+    # O "Voltar" de "pedidos" vai para "direito". O "Próximo" vai para "natureza_acao".
     with st.form("form_pedidos"):
         st.session_state.form_data["pedidos"] = st.text_area(
             "Insira os pedidos da ação de forma clara e objetiva", value=st.session_state.form_data.get("pedidos", ""),
-            height=300, key="pedidos_text_area",
+            height=300, key="pedidos_text_area_final",
             help="Liste os requerimentos finais ao juiz. Ex: citação do réu, procedência da ação para condenar o réu a..., condenação em custas e honorários. Use alíneas (a, b, c...)."
         )
-        col1, col2, col3 = st.columns([1,1,4])
+        col1, col2, col3 = st.columns([1,1,3])
         with col1:
-            if st.form_submit_button("⬅ Voltar"):
-                st.session_state.current_form_step_index -=1
+            if st.form_submit_button("⬅ Voltar (Direito)"):
+                st.session_state.current_form_step_index = FORM_STEPS.index("direito")
                 st.rerun()
-        with col2: submetido = st.form_submit_button("Próximo para Revisão ➡")
+        with col2: submetido = st.form_submit_button("Próximo (Natureza da Ação) ➡") # MODIFICADO: Próximo é Natureza da Ação
         with col3:
-            if st.form_submit_button("Sugerir Pedidos com IA (baseado no caso)"):
-                natureza_acao_informada = st.session_state.form_data.get("natureza_acao","")
-                fatos_informados_trecho = st.session_state.form_data.get("fatos","")[:300] # Trecho para contexto
-                direito_informado_trecho = st.session_state.form_data.get("fundamentacao_juridica","")[:300] # Trecho para contexto
-                prompt_str = ("Com base na Natureza da Ação ('{natureza_acao_informada}'), um resumo dos Fatos ('{fatos_informados_trecho}...') e um resumo do Direito ('{direito_informado_trecho}...'), "
+            if st.form_submit_button("Sugerir Pedidos com IA (baseado nos fatos e direito)"):
+                # Natureza da ação ainda não foi definida aqui.
+                fatos_informados_trecho = st.session_state.form_data.get("fatos","")[:300] 
+                direito_informado_trecho = st.session_state.form_data.get("fundamentacao_juridica","")[:300]
+                prompt_str = ("Com base um resumo dos Fatos ('{fatos_informados_trecho}...') e um resumo do Direito ('{direito_informado_trecho}...'), "
                               "elabore uma lista de pedidos típicos para uma petição inicial. Inclua pedidos como: citação do réu, procedência do pedido principal (seja específico se possível, ex: 'condenar o réu ao pagamento de X'), "
                               "condenação em custas processuais e honorários advocatícios. Formate os pedidos usando alíneas (a), (b), (c), etc.\nPedidos Sugeridos:")
                 gerar_conteudo_com_ia(prompt_str, {
-                    "natureza_acao_informada": natureza_acao_informada,
                     "fatos_informados_trecho": fatos_informados_trecho,
                     "direito_informado_trecho": direito_informado_trecho
                 }, "Pedidos", "pedidos")
@@ -888,67 +1127,259 @@ def exibir_formulario_pedidos():
 
         if submetido:
             if st.session_state.form_data.get("pedidos","").strip():
-                st.session_state.current_form_step_index += 1
+                st.session_state.current_form_step_index += 1 # Vai para natureza_acao
                 st.rerun()
             else: st.warning("Insira os pedidos.")
 
+# Função para Natureza da Ação (agora após Pedidos)
+def exibir_formulario_natureza_acao():
+    idx_etapa = FORM_STEPS.index('natureza_acao')
+    st.subheader(f"{idx_etapa + 1}. Definição da Natureza da Ação")
+    with st.form("form_natureza_final"): # Chave do formulário atualizada
+        fatos_contexto = st.session_state.form_data.get("fatos", "Fatos não fornecidos.")
+        direito_contexto = st.session_state.form_data.get("fundamentacao_juridica", "Fundamentação não fornecida.")
+        pedidos_contexto = st.session_state.form_data.get("pedidos", "Pedidos não fornecidos.")
+
+        st.info("Com base nos fatos, direito e pedidos que você informou, a IA pode sugerir a natureza técnica da ação.")
+        
+        with st.expander("Revisar Contexto para IA (Fatos, Direito, Pedidos)", expanded=False):
+            st.text_area("Fatos (Resumo)", value=fatos_contexto[:500] + ("..." if len(fatos_contexto)>500 else ""), height=100, disabled=True, key="natureza_fatos_ctx_final")
+            st.text_area("Direito (Resumo)", value=direito_contexto[:500] + ("..." if len(direito_contexto)>500 else ""), height=100, disabled=True, key="natureza_direito_ctx_final")
+            st.text_area("Pedidos (Resumo)", value=pedidos_contexto[:500] + ("..." if len(pedidos_contexto)>500 else ""), height=100, disabled=True, key="natureza_pedidos_ctx_final")
+
+        st.session_state.form_data["natureza_acao"] = st.text_input(
+            "Natureza da Ação (Ex: Ação de Indenização por Danos Morais c/c Danos Materiais)",
+            value=st.session_state.form_data.get("natureza_acao", ""), 
+            key="natureza_acao_text_input_final_val",
+            help="A IA pode sugerir. Refine ou altere conforme necessário."
+        )
+        
+        col1, col2, col3 = st.columns([1,1,3])
+        with col1:
+            if st.form_submit_button("⬅ Voltar (Pedidos)"):
+                st.session_state.current_form_step_index = FORM_STEPS.index("pedidos")
+                st.rerun()
+        with col2: submetido = st.form_submit_button("Próximo (Documentos) ➡") # MODIFICADO: Próximo é Documentos do Autor
+        with col3:
+            if st.form_submit_button("✨ Sugerir Natureza da Ação com IA"):
+                prompt_str = (
+                    "Você é um jurista experiente. Com base nos seguintes elementos de um caso:\n"
+                    "FATOS:\n{fatos_completos}\n\n"
+                    "FUNDAMENTAÇÃO JURÍDICA:\n{direito_completo}\n\n"
+                    "PEDIDOS:\n{pedidos_completos}\n\n"
+                    "Sugira o 'nomen iuris' (natureza da ação) mais adequado e técnico para este caso. "
+                    "Seja específico e, se aplicável, mencione cumulações (c/c). Exemplos: 'Ação de Cobrança pelo Rito Comum', 'Ação de Indenização por Danos Morais e Materiais', "
+                    "'Ação Declaratória de Inexistência de Débito c/c Repetição de Indébito e Indenização por Danos Morais'."
+                    "\nNatureza da Ação Sugerida:"
+                )
+                gerar_conteudo_com_ia(
+                    prompt_str, 
+                    {
+                        "fatos_completos": fatos_contexto,
+                        "direito_completo": direito_contexto,
+                        "pedidos_completos": pedidos_contexto
+                    }, 
+                    "Natureza da Ação", 
+                    "natureza_acao"
+                )
+        
+        if st.session_state.ia_generated_content_flags.get("natureza_acao"):
+            st.caption("📝 Conteúdo sugerido por IA. Revise e ajuste para precisão técnica.")
+
+        if submetido:
+            if st.session_state.form_data.get("natureza_acao","").strip():
+                st.session_state.current_form_step_index += 1 # Avança para 'documentos_autor'
+                st.rerun()
+            else: st.warning("Defina a natureza da ação ou peça uma sugestão à IA.")
+
+# Para Documentos do Autor
+def exibir_formulario_documentos_autor():
+    idx_etapa = FORM_STEPS.index('documentos_autor')
+    st.subheader(f"{idx_etapa + 1}. Documentos Juntados pelo Autor com a Petição Inicial")
+    st.markdown("Liste os principais documentos que o Autor juntaria. A IA pode ajudar a gerar descrições sucintas (1-2 frases).")
+
+    if "documentos_autor" not in st.session_state.form_data: # Inicialização defensiva
+        st.session_state.form_data["documentos_autor"] = []
+    if "num_documentos_autor" not in st.session_state or st.session_state.num_documentos_autor < 0:
+         st.session_state.num_documentos_autor = 0
+
+
+    if st.session_state.num_documentos_autor == 0:
+        st.info("Nenhum documento adicionado. Clique em 'Adicionar Documento' para começar ou prossiga se não houver documentos a listar.")
+    
+    # Garante que a lista 'documentos_autor' em form_data tenha o mesmo número de elementos que 'num_documentos_autor'
+    # Adiciona dicts vazios se num_documentos_autor for maior
+    while len(st.session_state.form_data["documentos_autor"]) < st.session_state.num_documentos_autor:
+        st.session_state.form_data["documentos_autor"].append({"tipo": TIPOS_DOCUMENTOS_COMUNS[0], "descricao": ""})
+    # Remove excesso se num_documentos_autor diminuiu (exceto pelo botão de remover)
+    if len(st.session_state.form_data["documentos_autor"]) > st.session_state.num_documentos_autor:
+         st.session_state.form_data["documentos_autor"] = st.session_state.form_data["documentos_autor"][:st.session_state.num_documentos_autor]
+
+
+    for i in range(st.session_state.num_documentos_autor):
+        with st.expander(f"Documento {i+1}: {st.session_state.form_data['documentos_autor'][i].get('tipo', 'Novo Documento')}", expanded=True):
+            doc_atual_ref = st.session_state.form_data["documentos_autor"][i] # Referência para facilitar
+
+            cols_doc = st.columns([3, 6]) 
+            doc_atual_ref["tipo"] = cols_doc[0].selectbox(
+                f"Tipo do Documento {i+1}", options=TIPOS_DOCUMENTOS_COMUNS, 
+                index=TIPOS_DOCUMENTOS_COMUNS.index(doc_atual_ref.get("tipo", TIPOS_DOCUMENTOS_COMUNS[0])),
+                key=f"doc_autor_tipo_{i}_final"
+            )
+            
+            doc_atual_ref["descricao"] = cols_doc[1].text_area(
+                f"Descrição/Conteúdo Sucinto do Documento {i+1}", 
+                value=doc_atual_ref.get("descricao", ""), 
+                key=f"doc_autor_desc_{i}_final", height=100,
+                help="Ex: 'Contrato de aluguel datado de 01/01/2022, assinado por X e Y, estabelecendo aluguel de R$ Z.' OU 'RG do autor, Sr. A, CPF nº B, comprovando seus dados de qualificação.'"
+            )
+            
+            if st.button(f"✨ Gerar Descrição IA para Doc. {i+1}", key=f"doc_autor_ia_btn_{i}_final"):
+                tipo_selecionado = doc_atual_ref["tipo"]
+                fatos_contexto = st.session_state.form_data.get("fatos", "Contexto factual não disponível.")
+                prompt_desc_doc = (
+                    f"Você é um assistente jurídico. Para um documento do tipo '{tipo_selecionado}' que será juntado por um Autor em uma ação judicial, "
+                    f"gere uma descrição MUITO SUCINTA (1 a 2 frases curtas, máximo 30 palavras) sobre seu conteúdo e propósito. "
+                    f"Contexto dos fatos do caso (resumido): '{fatos_contexto[:300]}...'. "
+                    "Exemplos de descrição:\n"
+                    "- Tipo: Contrato - Descrição: 'Contrato de prestação de serviços de consultoria, assinado em 10/03/2023 entre Autor e Réu, detalhando o escopo e valor dos serviços.'\n"
+                    "- Tipo: Documento de Identidade - Descrição: 'RG e CPF do Autor, Fulano de Tal, para fins de sua correta qualificação nos autos.'\n"
+                    "- Tipo: Prints de WhatsApp - Descrição: 'Capturas de tela de conversas via WhatsApp entre Autor e Réu, datadas de 05/04/2023 a 10/04/2023, evidenciando a negociação do acordo X.'\n"
+                    "\nDescrição Sucinta:"
+                )
+                gerar_conteudo_com_ia(
+                    prompt_desc_doc, 
+                    {}, # Campos do prompt já estão no template_string
+                    f"Descrição do Documento {i+1} ({tipo_selecionado})", 
+                    "documentos_autor", # Chave principal da lista
+                    sub_chave_lista="descricao", # Subchave a ser atualizada no dict da lista
+                    indice_lista=i # Índice na lista documentos_autor
+                )
+            
+            if st.session_state.ia_generated_content_flags.get("documentos_autor_descricoes", {}).get(f"doc_{i}"):
+                st.caption("📝 Descrição gerada/sugerida por IA. Revise.")
+    
+    st.markdown("---")
+    col_botoes_add_rem_1, col_botoes_add_rem_2 = st.columns(2)
+    if col_botoes_add_rem_1.button("➕ Adicionar Documento", key="add_doc_autor_btn_final", help="Adiciona um novo campo para listar um documento."):
+        st.session_state.num_documentos_autor += 1
+        # O loop acima já garante que form_data["documentos_autor"] será estendido se necessário no rerun
+        st.rerun()
+
+    if st.session_state.num_documentos_autor > 0:
+        if col_botoes_add_rem_2.button("➖ Remover Último Documento", key="rem_doc_autor_btn_final", help="Remove o último campo de documento da lista."):
+            st.session_state.num_documentos_autor -= 1
+            if st.session_state.form_data["documentos_autor"]: # Garante que não tentará pop de lista vazia
+                st.session_state.form_data["documentos_autor"].pop()
+            # Limpa flag de IA se existir para o índice removido
+            if f"doc_{st.session_state.num_documentos_autor}" in st.session_state.ia_generated_content_flags.get("documentos_autor_descricoes", {}):
+                del st.session_state.ia_generated_content_flags["documentos_autor_descricoes"][f"doc_{st.session_state.num_documentos_autor}"]
+            st.rerun()
+    st.markdown("---")
+
+    with st.form("form_documentos_autor_nav_final"):
+        col_nav1, col_nav2 = st.columns(2)
+        with col_nav1:
+            if st.form_submit_button("⬅ Voltar (Natureza da Ação)"):
+                st.session_state.current_form_step_index = FORM_STEPS.index("natureza_acao")
+                st.rerun()
+        with col_nav2:
+            if st.form_submit_button("Próximo (Revisar e Simular) ➡"):
+                documentos_validos = True
+                # Remove documentos vazios (sem tipo definido como não sendo "Nenhum..." e sem descrição) antes de validar
+                docs_filtrados = []
+                for doc_item in st.session_state.form_data.get("documentos_autor", []):
+                    tipo_valido = doc_item.get("tipo") != TIPOS_DOCUMENTOS_COMUNS[0] # Não é "Nenhum..."
+                    descricao_presente = doc_item.get("descricao","").strip()
+                    if tipo_valido and descricao_presente: # Se tem tipo (que não "Nenhum") E descrição
+                        docs_filtrados.append(doc_item)
+                    elif not tipo_valido and descricao_presente: # Se é "Nenhum..." mas tem descrição (descrição factual)
+                         docs_filtrados.append({"tipo": TIPOS_DOCUMENTOS_COMUNS[0], "descricao": descricao_presente})
+                    # Se for "Nenhum" e sem descrição, ou tipo válido mas sem descrição, será ignorado/removido
+                
+                st.session_state.form_data["documentos_autor"] = docs_filtrados
+                st.session_state.num_documentos_autor = len(docs_filtrados) # Atualiza o contador
+
+                # Validação após limpeza: se ainda há documentos, devem ter tipo e descrição.
+                # Esta validação já foi mais ou menos feita pela filtragem.
+                # Apenas para garantir, mas a lógica de filtragem acima deve ser suficiente.
+                # for idx, doc in enumerate(st.session_state.form_data["documentos_autor"]):
+                #     if not doc.get("tipo") or (doc.get("tipo") != TIPOS_DOCUMENTOS_COMUNS[0] and not doc.get("descricao","").strip()):
+                #         st.warning(f"Documento {idx+1} ('{doc.get('tipo')}') parece incompleto. Verifique tipo e descrição ou remova.")
+                #         documentos_validos = False
+                #         break
+                
+                if documentos_validos: # Se passou na validação (ou se a filtragem é suficiente)
+                    st.session_state.current_form_step_index += 1 
+                    st.rerun()
+
+
 def exibir_revisao_e_iniciar_simulacao():
-    st.subheader("7. Revisar Dados e Iniciar Simulação")
+    idx_etapa = FORM_STEPS.index('revisar_e_simular')
+    st.subheader(f"{idx_etapa + 1}. Revisar Dados e Iniciar Simulação")
     form_data_local = st.session_state.form_data
     st.info(f"**ID do Processo (Gerado):** `{form_data_local.get('id_processo', 'N/A')}`")
 
-    # Usar st.text_area com disabled=True para exibir os dados de forma consistente
-    # Adicionar uma altura padrão menor para os expanders fechados e maior para os abertos se desejado
+    with st.expander("Qualificação do Autor", expanded=False): 
+        st.text_area("Revisão - Autor", value=form_data_local.get("qualificacao_autor", "Não preenchido"), height=100, disabled=True, key="rev_autor_area_final_2")
+    with st.expander("Qualificação do Réu", expanded=False): 
+        st.text_area("Revisão - Réu", value=form_data_local.get("qualificacao_reu", "Não preenchido"), height=100, disabled=True, key="rev_reu_area_final_2")
+    with st.expander("Fatos", expanded=True): 
+        st.text_area("Revisão - Fatos", value=form_data_local.get("fatos", "Não preenchido"), height=200, disabled=True, key="rev_fatos_area_final_2")
+    with st.expander("Fundamentação Jurídica", expanded=False): 
+        st.text_area("Revisão - Direito", value=form_data_local.get("fundamentacao_juridica", "Não preenchido"), height=200, disabled=True, key="rev_dir_area_final_2")
+    with st.expander("Pedidos", expanded=False): 
+        st.text_area("Revisão - Pedidos", value=form_data_local.get("pedidos", "Não preenchido"), height=200, disabled=True, key="rev_ped_area_final_2")
+    with st.expander("Natureza da Ação", expanded=False): 
+        st.text_input("Revisão - Natureza da Ação", value=form_data_local.get("natureza_acao", "Não preenchido"), disabled=True, key="rev_nat_input_final_2")
     
-    with st.expander("Qualificação do Autor", expanded=False):
-        st.text_area("Revisão - Autor", value=form_data_local.get("qualificacao_autor", "Não preenchido"), height=100, disabled=True, key="rev_autor_area")
-    with st.expander("Qualificação do Réu", expanded=False):
-        st.text_area("Revisão - Réu", value=form_data_local.get("qualificacao_reu", "Não preenchido"), height=100, disabled=True, key="rev_reu_area")
-    with st.expander("Natureza da Ação", expanded=False):
-        st.text_input("Revisão - Natureza", value=form_data_local.get("natureza_acao", "Não preenchido"), disabled=True, key="rev_nat_input") # text_input aqui é ok
-    with st.expander("Fatos", expanded=True): # Fatos podem ser mais longos, expandir por padrão
-        st.text_area("Revisão - Fatos", value=form_data_local.get("fatos", "Não preenchido"), height=200, disabled=True, key="rev_fatos_area")
-    with st.expander("Fundamentação Jurídica", expanded=False):
-        st.text_area("Revisão - Direito", value=form_data_local.get("fundamentacao_juridica", "Não preenchido"), height=200, disabled=True, key="rev_dir_area")
-    with st.expander("Pedidos", expanded=False):
-        st.text_area("Revisão - Pedidos", value=form_data_local.get("pedidos", "Não preenchido"), height=200, disabled=True, key="rev_ped_area")
-
+    # MODIFICADO: Seção para revisar documentos do autor
+    with st.expander("Documentos Juntados pelo Autor", expanded=True):
+        documentos_autor_revisao = form_data_local.get("documentos_autor", [])
+        if documentos_autor_revisao:
+            for i, doc in enumerate(documentos_autor_revisao):
+                st.markdown(f"**Documento {i+1}:** {doc.get('tipo', 'N/A')}")
+                st.text_area(f"Descrição Doc. {i+1}", value=doc.get('descricao', 'Sem descrição'), height=75, disabled=True, key=f"rev_doc_autor_{i}_final")
+        else:
+            st.write("Nenhum documento foi listado pelo autor.")
+    
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("⬅ Voltar para Editar Pedidos", use_container_width=True):
-            # Navega para o penúltimo passo (índice de "pedidos")
-            st.session_state.current_form_step_index = FORM_STEPS.index("pedidos")
+        if st.button("⬅ Voltar (Documentos do Autor)", use_container_width=True): # MODIFICADO: Botão Voltar
+            st.session_state.current_form_step_index = FORM_STEPS.index("documentos_autor")
             st.rerun()
     with col2:
-        # Verifica se todos os campos essenciais foram preenchidos antes de habilitar o botão de simulação
         campos_obrigatorios = ["qualificacao_autor", "qualificacao_reu", "natureza_acao", "fatos", "fundamentacao_juridica", "pedidos"]
         todos_preenchidos = all(form_data_local.get(campo, "").strip() for campo in campos_obrigatorios)
         
         if st.button("🚀 Iniciar Simulação com estes Dados", type="primary", disabled=not todos_preenchidos, use_container_width=True):
             st.session_state.simulation_running = True
-            # Limpar resultados de simulações anteriores para o ID de processo atual, se for um novo.
-            # O ID do processo já é atualizado em inicializar_estado_formulario se for uma "Nova Simulação".
-            # Se o usuário apenas navegou e voltou, o ID é o mesmo.
             current_pid = form_data_local.get('id_processo')
-            if current_pid in st.session_state.simulation_results:
-                 del st.session_state.simulation_results[current_pid] # Garante que rodará novamente para este ID se clicado
-
+            # Limpa resultados para este ID se já existirem, para forçar nova simulação
+            if current_pid in st.session_state.get('simulation_results', {}):
+                 del st.session_state.simulation_results[current_pid] 
             st.rerun()
         elif not todos_preenchidos:
-            st.warning("Alguns campos obrigatórios (Autor, Réu, Natureza, Fatos, Direito, Pedidos) parecem não estar preenchidos. Por favor, revise e complete-os antes de iniciar a simulação.")
-
+            st.warning("Campos essenciais (Autor, Réu, Fatos, Direito, Pedidos, Natureza da Ação) devem ser preenchidos.")
 
 def rodar_simulacao_principal(dados_coletados: dict):
     st.markdown(f"--- INICIANDO SIMULAÇÃO PARA O CASO: **{dados_coletados.get('id_processo','N/A')}** ---")
     
-    # Validação defensiva
     if not dados_coletados or not dados_coletados.get('id_processo'):
         st.error("Erro: Dados do caso incompletos para iniciar a simulação.")
         st.session_state.simulation_running = False
-        if st.button("Retornar ao formulário"):
-            st.rerun()
+        if st.button("Retornar ao formulário"): st.rerun()
         return
+
+    # MODIFICADO: Incluir documentos do autor no texto do processo
+    documentos_autor_formatado = "\n\n--- Documentos Juntados pelo Autor (conforme informado no formulário) ---\n"
+    docs_autor_lista = dados_coletados.get("documentos_autor", [])
+    if docs_autor_lista:
+        for i, doc in enumerate(docs_autor_lista):
+            documentos_autor_formatado += f"{i+1}. Tipo: {doc.get('tipo', 'N/A')}\n   Descrição/Propósito: {doc.get('descricao', 'N/A')}\n"
+    else:
+        documentos_autor_formatado += "Nenhum documento específico foi listado pelo autor no formulário inicial para esta simulação.\n"
 
     conteudo_processo_texto = f"""
 ID do Processo: {dados_coletados.get('id_processo')}
@@ -960,14 +1391,15 @@ Qualificação do Réu:
 
 Natureza da Ação: {dados_coletados.get('natureza_acao')}
 
-Fatos:
+Dos Fatos:
 {dados_coletados.get('fatos')}
 
-Fundamentação Jurídica:
+Da Fundamentação Jurídica:
 {dados_coletados.get('fundamentacao_juridica')}
 
-Pedidos:
+Dos Pedidos:
 {dados_coletados.get('pedidos')}
+{documentos_autor_formatado}
     """
     documento_do_caso_atual = Document(
         page_content=conteudo_processo_texto,
@@ -978,15 +1410,19 @@ Pedidos:
         }
     )
     
+    # ... (Restante da função rodar_simulacao_principal como na versão anterior, pois as mudanças nela já foram boas)
+    # A inicialização do RAG, o estado_inicial, e o loop de app.stream permanecem os mesmos.
+    # A exibição dos resultados também.
+
     retriever_do_caso = None
-    placeholder_rag = st.empty() # Usar placeholder para mensagens de status do RAG
+    placeholder_rag = st.empty() 
     with placeholder_rag.status("⚙️ Inicializando sistema RAG com dados do formulário...", expanded=True):
         st.write("Carregando modelos e criando índice vetorial...")
         try:
             retriever_do_caso = criar_ou_carregar_retriever(
                 dados_coletados.get('id_processo'), 
                 documento_caso_atual=documento_do_caso_atual, 
-                recriar_indice=True # Sempre recriar para garantir que os dados do formulário atual sejam usados
+                recriar_indice=True 
             )
             if retriever_do_caso:
                 st.write("✅ Retriever RAG pronto!")
@@ -994,45 +1430,43 @@ Pedidos:
                 st.write("⚠️ Falha ao inicializar o retriever RAG.")
         except Exception as e_rag:
             st.error(f"Erro crítico na inicialização do RAG: {e_rag}")
-            retriever_do_caso = None # Garante que está None em caso de falha
+            retriever_do_caso = None 
 
     if not retriever_do_caso:
-        placeholder_rag.empty() # Limpa o status
+        placeholder_rag.empty() 
         st.error("Falha crítica ao criar o retriever com os dados do formulário. A simulação não pode continuar.")
         st.session_state.simulation_running = False
         if st.button("Tentar Novamente (Recarregar Formulário)"):
-             st.session_state.current_form_step_index = FORM_STEPS.index("revisar_e_simular") # Volta para revisão
+             st.session_state.current_form_step_index = FORM_STEPS.index("revisar_e_simular") 
              st.rerun()
         return
 
     placeholder_rag.success("🚀 Sistema RAG inicializado e pronto!")
-    time.sleep(1.5) # Pequena pausa para o usuário ver a mensagem de sucesso
+    time.sleep(1.5) 
     placeholder_rag.empty()
 
-
+    # Adicionando o campo 'documentos_juntados_pelo_reu' ao estado inicial, mesmo que vazio.
     estado_inicial = EstadoProcessual(
         id_processo=dados_coletados.get('id_processo'),
         retriever=retriever_do_caso,
         nome_do_ultimo_no_executado=None, etapa_concluida_pelo_ultimo_no=None,
-        proximo_ator_sugerido_pelo_ultimo_no=ADVOGADO_AUTOR, # O grafo define o ponto de entrada, mas aqui é uma sugestão inicial
+        proximo_ator_sugerido_pelo_ultimo_no=ADVOGADO_AUTOR, 
         documento_gerado_na_etapa_recente=None, historico_completo=[],
         pontos_controvertidos_saneamento=None, manifestacao_autor_sem_provas=False,
-        manifestacao_reu_sem_provas=False, etapa_a_ser_executada_neste_turno="", # Será definido pelo nó
-        dados_formulario_entrada=dados_coletados 
+        manifestacao_reu_sem_provas=False, etapa_a_ser_executada_neste_turno="",
+        dados_formulario_entrada=dados_coletados,
+        documentos_juntados_pelo_reu=None # Inicializa como None
     )
 
     st.subheader("⏳ Acompanhamento da Simulação:")
     if 'expand_all_steps' not in st.session_state: st.session_state.expand_all_steps = True
     
-    # Usar colunas para o botão não ocupar a largura toda se não desejado
-    # col_toggle, _ = st.columns([1,3])
-    # with col_toggle:
-    if st.checkbox("Expandir todos os passos da simulação", value=st.session_state.expand_all_steps, key="cb_expand_all_sim_steps", on_change=lambda: setattr(st.session_state, 'expand_all_steps', st.session_state.cb_expand_all_sim_steps)):
-        pass # Ação já feita pelo on_change
+    if st.checkbox("Expandir todos os passos da simulação", value=st.session_state.expand_all_steps, key="cb_expand_all_sim_steps_final", on_change=lambda: setattr(st.session_state, 'expand_all_steps', st.session_state.cb_expand_all_sim_steps_final)):
+        pass 
         
     progress_bar_placeholder = st.empty()
     steps_container = st.container()
-    max_passos_simulacao = 10 
+    max_passos_simulacao = 12 # Aumentado um pouco devido à complexidade
     passo_atual_simulacao = 0
     estado_final_simulacao = None
 
@@ -1040,31 +1474,23 @@ Pedidos:
         for s_idx, s_event in enumerate(app.stream(input=estado_inicial, config={"recursion_limit": max_passos_simulacao})):
             passo_atual_simulacao += 1
             if not s_event or not isinstance(s_event, dict) or not list(s_event.keys()):
-                # st.write(f"Debug: Evento {s_idx} vazio ou formato inesperado: {s_event}")
                 continue
 
             nome_do_no_executado = list(s_event.keys())[0]
-            # st.write(f"Debug: Evento {s_idx} - Nó: {nome_do_no_executado}, Conteúdo: {s_event[nome_do_no_executado]}")
-
-
+            
             if nome_do_no_executado == "__end__":
-                estado_final_simulacao = list(s_event.values())[0] # O estado final está no valor
-                nome_do_no_executado = END # Alinha com a lógica de exibição
+                estado_final_simulacao = list(s_event.values())[0] 
+                nome_do_no_executado = END 
             else:
-                # Assume que o valor associado à chave do nó é o estado atualizado
                 estado_parcial_apos_no = s_event[nome_do_no_executado]
-                if not isinstance(estado_parcial_apos_no, dict): # Checagem extra
-                    # st.write(f"Debug: Conteúdo inesperado para nó {nome_do_no_executado}: {estado_parcial_apos_no}")
-                    # Se o estado não for um dicionário, pode ser um erro ou formato diferente.
-                    # Tentar pegar o último estado conhecido se possível, ou registrar erro.
-                    if estado_final_simulacao: # Usa o último estado válido se este for problemático
-                         pass # Mantém o estado_final_simulacao anterior
-                    else: # Se for o primeiro e já deu problema
+                if not isinstance(estado_parcial_apos_no, dict): 
+                    if estado_final_simulacao: 
+                         pass 
+                    else: 
                          st.error(f"Formato de estado inesperado no nó {nome_do_no_executado}. A simulação pode estar inconsistente.")
                          break
                 else:
                     estado_final_simulacao = estado_parcial_apos_no
-
 
             etapa_concluida_log = estado_final_simulacao.get('etapa_concluida_pelo_ultimo_no', 'N/A')
             doc_gerado_completo = str(estado_final_simulacao.get('documento_gerado_na_etapa_recente', ''))
@@ -1077,12 +1503,14 @@ Pedidos:
                 st.markdown(f"**Nó Executado:** `{nome_do_no_executado}`")
                 st.markdown(f"**Etapa Concluída:** `{etapa_concluida_log}`")
                 if etapa_concluida_log not in ["ERRO_FLUXO_IRRECUPERAVEL", "ERRO_ETAPA_NAO_ENCONTRADA"] and doc_gerado_completo:
-                    st.text_area("Documento Gerado:", value=doc_gerado_completo, height=200, key=f"doc_step_sim_{passo_atual_simulacao}", disabled=True)
-                elif doc_gerado_completo: # Se for erro, mas tiver documento, mostrar como erro
+                    st.text_area("Documento Gerado:", value=doc_gerado_completo, height=200, key=f"doc_step_sim_{passo_atual_simulacao}_final", disabled=True)
+                elif doc_gerado_completo: 
                     st.error(f"Detalhe do Erro/Documento: {doc_gerado_completo}")
                 st.markdown(f"**Próximo Ator Sugerido (pelo nó):** `{prox_ator_sug_log}`")
             
-            progress_val = min(1.0, passo_atual_simulacao / (len(mapa_tarefa_no_atual) + 1) ) # Estimativa baseada no número de transições possíveis
+            # Estimativa de progresso pode ser mais complexa agora, mas vamos simplificar
+            num_total_etapas_estimadas = len(mapa_tarefa_no_atual) + 2 # Adiciona 2 para PI e possível etapa final
+            progress_val = min(1.0, passo_atual_simulacao / num_total_etapas_estimadas ) 
             progress_bar_placeholder.progress(progress_val, text=f"Simulando... {int(progress_val*100)}%")
 
             if nome_do_no_executado == END or prox_ator_sug_log == ETAPA_FIM_PROCESSO:
@@ -1108,18 +1536,17 @@ Pedidos:
         st.text_area("Stack Trace do Erro:", traceback.format_exc(), height=300)
     finally:
         progress_bar_placeholder.empty()
-        # Considerar se simulation_running deve ser resetado aqui ou por um botão de "Nova Simulação"
-        # st.session_state.simulation_running = False # Descomentar se quiser permitir nova simulação automaticamente após esta terminar/falhar
 
+
+# --- Função exibir_resultados_simulacao (sem grandes mudanças estruturais aqui, mas pode exibir docs do réu) ---
 def exibir_resultados_simulacao(estado_final_simulacao: dict):
     st.markdown("---")
     st.subheader("📊 Resultados da Simulação")
-    
-    # O placeholder para visualização de documento individual já é gerenciado no escopo da função
     doc_completo_placeholder_sim = st.empty()
 
     if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
         st.markdown("#### Linha do Tempo Interativa do Processo")
+        # ... (código da linha do tempo como antes) ...
         historico = estado_final_simulacao["historico_completo"]
         icon_map = { 
             ADVOGADO_AUTOR: "🙋‍♂️", JUIZ: "⚖️", ADVOGADO_REU: "🙋‍♀️", 
@@ -1131,7 +1558,7 @@ def exibir_resultados_simulacao(estado_final_simulacao: dict):
         }
         num_etapas = len(historico)
         if num_etapas > 0 :
-            cols = st.columns(min(num_etapas, 7)) # Limitar colunas para melhor visualização
+            cols = st.columns(min(num_etapas, 8)) # Aumentado para 8 se houver mais etapas com docs
             for i, item_hist in enumerate(historico):
                 ator_hist = item_hist.get('ator', 'N/A')
                 etapa_hist = item_hist.get('etapa', 'N/A')
@@ -1139,39 +1566,26 @@ def exibir_resultados_simulacao(estado_final_simulacao: dict):
                 
                 ator_icon = icon_map.get(ator_hist, icon_map["DEFAULT_ACTOR"])
                 etapa_icon = icon_map.get(etapa_hist, icon_map["DEFAULT_ETAPA"])
-                
-                # Adicionar cor de fundo baseada em erro
                 cor_fundo = "rgba(255, 0, 0, 0.1)" if "ERRO" in etapa_hist else "rgba(0, 0, 0, 0.03)"
 
                 with cols[i % len(cols)]:
-                    container_style = f"""
-                        border: 1px solid #ddd; 
-                        border-radius: 5px; 
-                        padding: 10px; 
-                        text-align: center; 
-                        background-color: {cor_fundo};
-                        height: 120px; 
-                        display: flex; 
-                        flex-direction: column; 
-                        justify-content: space-around;
-                        margin-bottom: 5px; /* Espaço entre os cards da linha do tempo */
-                    """
+                    container_style = f"border: 1px solid #ddd; border-radius: 5px; padding: 10px; text-align: center; background-color: {cor_fundo}; height: 130px; display: flex; flex-direction: column; justify-content: space-around; margin-bottom: 5px;"
                     st.markdown(f"<div style='{container_style}'>", unsafe_allow_html=True)
                     st.markdown(f"<div style='font-size: 28px;'>{ator_icon}{etapa_icon}</div>", unsafe_allow_html=True)
                     st.markdown(f"<div style='font-size: 11px; margin-bottom: 3px;'><b>{ator_hist}</b><br>{etapa_hist[:30]}{'...' if len(etapa_hist)>30 else ''}</div>", unsafe_allow_html=True)
-                    if st.button(f"Ver Doc {i+1}", key=f"btn_timeline_sim_{i}", help=f"Visualizar: {etapa_hist}", use_container_width=True):
+                    if st.button(f"Ver Doc {i+1}", key=f"btn_timeline_sim_{i}_final", help=f"Visualizar: {etapa_hist}", use_container_width=True):
                         st.session_state.doc_visualizado = doc_completo_hist
                         st.session_state.doc_visualizado_titulo = f"Documento da Linha do Tempo (Passo {i+1}): {ator_hist} - {etapa_hist}"
                         st.rerun() 
                     st.markdown("</div>", unsafe_allow_html=True)
-            st.markdown("<hr>", unsafe_allow_html=True) # Separador visual
+            st.markdown("<hr>", unsafe_allow_html=True) 
     else: st.warning("Nenhum histórico completo para exibir na linha do tempo.")
 
-    if st.session_state.get('doc_visualizado') is not None: # Usar get para segurança
+    if st.session_state.get('doc_visualizado') is not None: 
         with doc_completo_placeholder_sim.container():
             st.subheader(st.session_state.get('doc_visualizado_titulo', "Visualização de Documento"))
-            st.text_area("Conteúdo do Documento:", st.session_state.doc_visualizado, height=350, key="doc_view_sim_area_main_results", disabled=True)
-            if st.button("Fechar Visualização do Documento", key="close_doc_view_sim_btn_main_results", type="primary"):
+            st.text_area("Conteúdo do Documento:", st.session_state.doc_visualizado, height=350, key="doc_view_sim_area_main_results_final", disabled=True)
+            if st.button("Fechar Visualização do Documento", key="close_doc_view_sim_btn_main_results_final", type="primary"):
                 st.session_state.doc_visualizado = None
                 st.session_state.doc_visualizado_titulo = ""
                 st.rerun()
@@ -1179,18 +1593,28 @@ def exibir_resultados_simulacao(estado_final_simulacao: dict):
     st.markdown("#### Histórico Detalhado (Conteúdo Completo das Etapas)")
     if 'expand_all_history' not in st.session_state: st.session_state.expand_all_history = False
     
-    if st.checkbox("Expandir todo o histórico detalhado", value=st.session_state.expand_all_history, key="cb_expand_all_hist_detail_sim", on_change=lambda: setattr(st.session_state, 'expand_all_history', st.session_state.cb_expand_all_hist_detail_sim)):
+    if st.checkbox("Expandir todo o histórico detalhado", value=st.session_state.expand_all_history, key="cb_expand_all_hist_detail_sim_final", on_change=lambda: setattr(st.session_state, 'expand_all_history', st.session_state.cb_expand_all_hist_detail_sim_final)):
         pass
 
     if estado_final_simulacao and estado_final_simulacao.get("historico_completo"):
         for i, item_hist in enumerate(estado_final_simulacao["historico_completo"]):
-            ator_hist = item_hist.get('ator', 'N/A')
-            etapa_hist = item_hist.get('etapa', 'N/A')
+            ator_hist = item_hist.get('ator', 'N/A'); etapa_hist = item_hist.get('etapa', 'N/A')
             doc_completo_hist = str(item_hist.get('documento', 'N/A'))
             with st.expander(f"Detalhe {i+1}: Ator '{ator_hist}' | Etapa '{etapa_hist}'", expanded=st.session_state.expand_all_history):
-                st.text_area(f"Documento Completo (Passo {i+1}):", value=doc_completo_hist, height=200, key=f"doc_hist_detail_sim_{i}", disabled=True)
+                st.text_area(f"Documento Completo (Passo {i+1}):", value=doc_completo_hist, height=200, key=f"doc_hist_detail_sim_{i}_final", disabled=True)
+    
+    # NOVO: Exibir documentos juntados pelo Réu (se existirem)
+    if estado_final_simulacao and estado_final_simulacao.get("documentos_juntados_pelo_reu"):
+        st.markdown("#### Documentos Juntados pelo Réu (Gerados pela IA)")
+        with st.expander("Ver Documentos do Réu", expanded=False):
+            for i, doc_reu in enumerate(estado_final_simulacao.get("documentos_juntados_pelo_reu", [])):
+                st.markdown(f"**Documento {i+1} (Réu):** {doc_reu.get('tipo', 'N/A')}")
+                st.text_area(f"Descrição Doc. Réu {i+1}", value=doc_reu.get('descricao', 'Sem descrição'), height=75, disabled=True, key=f"res_doc_reu_{i}")
+
     st.markdown("--- FIM DA EXIBIÇÃO DOS RESULTADOS ---")
 
+
+# --- Bloco Principal de Execução do Streamlit ---
 if __name__ == "__main__":
     st.set_page_config(layout="wide", page_title="IA-Mestra: Simulação Jurídica Avançada", page_icon="⚖️")
     st.title("IA-Mestra: Simulação Jurídica Avançada ⚖️")
@@ -1198,33 +1622,29 @@ if __name__ == "__main__":
 
     if not GOOGLE_API_KEY:
         st.error("🔴 ERRO CRÍTICO: A variável de ambiente GOOGLE_API_KEY não foi definida. A aplicação não pode funcionar sem ela.")
-        st.stop() # Impede a execução do restante do app se a chave estiver ausente
+        st.stop() 
     
-    # Inicializa o estado da sessão (deve ser chamado no início)
     inicializar_estado_formulario() 
     
     st.sidebar.title("Painel de Controle 🕹️")
-    if st.sidebar.button("🔄 Nova Simulação (Limpar Formulário)", key="nova_sim_btn_sidebar", type="primary", use_container_width=True):
-        # Reseta o índice do formulário para o início
+    if st.sidebar.button("🔄 Nova Simulação (Limpar Formulário)", key="nova_sim_btn_sidebar_final", type="primary", use_container_width=True):
         st.session_state.current_form_step_index = 0
-        # Cria um novo ID de processo para a nova simulação
         novo_id_processo = f"caso_sim_{int(time.time())}"
-        # Limpa os dados do formulário, mas já define o novo ID
+        # Reinicializa completamente form_data e flags relacionadas
         st.session_state.form_data = {
-            "id_processo": novo_id_processo, 
-            "qualificacao_autor": "", "qualificacao_reu": "", "natureza_acao": "",
-            "fatos": "", "fundamentacao_juridica": "", "pedidos": ""
+            "id_processo": novo_id_processo, "qualificacao_autor": "", "qualificacao_reu": "", 
+            "fatos": "", "fundamentacao_juridica": "", "pedidos": "",
+            "natureza_acao": "", "documentos_autor": []
         }
-        # Reseta as flags de conteúdo gerado por IA
         st.session_state.ia_generated_content_flags = {key: False for key in st.session_state.form_data.keys()}
-        # Não limpa 'simulation_results' aqui, pois pode ser útil ver o histórico de execuções anteriores.
-        # Em vez disso, a lógica em 'rodar_simulacao_principal' ou 'exibir_revisao_e_iniciar_simulacao'
-        # deve garantir que uma nova simulação para um ID existente seja forçada ou os resultados sejam limpos seletivamente.
-        # Se o ID é sempre novo, não há conflito.
-        
-        st.session_state.simulation_running = False # Garante que voltará para a tela de formulário
+        st.session_state.ia_generated_content_flags["documentos_autor_descricoes"] = {}
+        st.session_state.num_documentos_autor = 0 # Reset do contador de documentos
+
+        st.session_state.simulation_running = False 
         if 'doc_visualizado' in st.session_state: st.session_state.doc_visualizado = None 
         if 'doc_visualizado_titulo' in st.session_state: st.session_state.doc_visualizado_titulo = ""
+        # Considerar limpar st.session_state.simulation_results se desejar apagar histórico entre simulações
+        # st.session_state.simulation_results = {} 
         st.rerun()
 
     st.sidebar.markdown("---")
@@ -1233,68 +1653,83 @@ if __name__ == "__main__":
         "A IA pode auxiliar no preenchimento com dados fictícios ou sugestões jurídicas contextuais."
     )
     st.sidebar.markdown("---")
-    # Link para o LangSmith (se configurado)
     if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_PROJECT"):
         project_name = os.getenv("LANGCHAIN_PROJECT")
-        st.sidebar.markdown(f"🔍 [Monitorar no LangSmith](https://smith.langchain.com/o/{os.getenv('LANGCHAIN_TENANT_ID', 'default')}/projects/p/{project_name})", unsafe_allow_html=True)
+        # LANGCHAIN_TENANT_ID pode não ser o termo correto para o URL do LangSmith; pode ser o nome da organização ou UUID.
+        # O URL típico é smith.langchain.com/o/{organization_id}/projects/p/{project_name}
+        # Se LANGCHAIN_ENDPOINT existir e for algo como https://api.smith.langchain.com, o URL base é smith.langchain.com.
+        # Por simplicidade, manter o link genérico se o tenant ID não for facilmente obtido.
+        langsmith_url_base = "https://smith.langchain.com/"
+        org_id_ou_tenant = os.getenv('LANGCHAIN_TENANT_ID', None) # Ou outro env var que possa conter o ID da organização
+        if org_id_ou_tenant:
+            langsmith_url = f"{langsmith_url_base}o/{org_id_ou_tenant}/projects/{project_name}"
+        else: # Fallback para um link mais genérico se o ID da org não estiver disponível
+            langsmith_url = f"{langsmith_url_base}projects/{project_name}" 
+            # Ou até mesmo apenas "https://smith.langchain.com/" se o nome do projeto não garante acesso direto.
+            # O link mais seguro sem ID da organização é para a página de projetos geral, e o usuário navega.
+            # langsmith_url = f"https://smith.langchain.com/projects" (mais seguro)
+
+        st.sidebar.markdown(f"🔍 [Monitorar no LangSmith]({langsmith_url})", unsafe_allow_html=True)
 
 
     # --- Lógica Principal de Exibição da UI ---
     if st.session_state.get('simulation_running', False):
+        # ... (lógica de rodar/exibir simulação como antes, já estava boa) ...
         id_processo_atual = st.session_state.form_data.get('id_processo')
-        
-        # Se a simulação está marcada como rodando, mas não temos resultados para o ID atual, rodar.
-        # Ou, se o usuário explicitamente iniciou (botão em exibir_revisao_e_iniciar_simulacao seta simulation_running = True)
         if id_processo_atual and id_processo_atual not in st.session_state.get('simulation_results', {}):
             rodar_simulacao_principal(st.session_state.form_data)
-        # Se temos resultados para o ID atual, exibir.
         elif id_processo_atual and st.session_state.get('simulation_results', {}).get(id_processo_atual):
             st.info(f"📖 Exibindo resultados da simulação para o ID: {id_processo_atual}")
             exibir_resultados_simulacao(st.session_state.simulation_results[id_processo_atual])
-            if st.button("Iniciar uma Nova Simulação (Limpar Formulário)"): # Botão para facilitar o reinício após ver resultados
-                # Código similar ao botão da sidebar para resetar
+            if st.button("Iniciar uma Nova Simulação (Limpar Formulário)", key="nova_sim_btn_results_final"): 
                 st.session_state.current_form_step_index = 0
                 novo_id_processo = f"caso_sim_{int(time.time())}"
-                st.session_state.form_data = { "id_processo": novo_id_processo, "qualificacao_autor": "", "qualificacao_reu": "", "natureza_acao": "", "fatos": "", "fundamentacao_juridica": "", "pedidos": "" }
+                st.session_state.form_data = { "id_processo": novo_id_processo, "qualificacao_autor": "", "qualificacao_reu": "", "fatos": "", "fundamentacao_juridica": "", "pedidos": "", "natureza_acao": "", "documentos_autor": [] }
                 st.session_state.ia_generated_content_flags = {key: False for key in st.session_state.form_data.keys()}
+                st.session_state.ia_generated_content_flags["documentos_autor_descricoes"] = {}
+                st.session_state.num_documentos_autor = 0
                 st.session_state.simulation_running = False
                 if 'doc_visualizado' in st.session_state: st.session_state.doc_visualizado = None
                 st.rerun()
         else: 
             st.warning("⚠️ A simulação anterior não produziu resultados ou houve um problema de estado. Por favor, inicie uma nova simulação.")
             st.session_state.simulation_running = False 
-            if st.button("Ir para o início do formulário"):
+            if st.button("Ir para o início do formulário", key="goto_form_start_final"):
                  st.session_state.current_form_step_index = 0
                  st.rerun()
-
     else: # Exibir formulários
         passo_atual_idx = st.session_state.current_form_step_index
         
         # --- Indicador de Progresso do Formulário ---
-        if 0 <= passo_atual_idx < len(FORM_STEPS): # Checagem de segurança para o índice
+        if 0 <= passo_atual_idx < len(FORM_STEPS):
             nome_passo_atual = FORM_STEPS[passo_atual_idx]
+            # O total de passos de preenchimento é len(FORM_STEPS) - 1 (excluindo a revisão)
+            total_passos_preenchimento = len(FORM_STEPS) -1
+            
             if nome_passo_atual != "revisar_e_simular":
-                progresso_percentual = (passo_atual_idx + 1) / (len(FORM_STEPS) -1) # -1 porque revisar não é um passo de preenchimento ativo
+                # Progresso baseado no índice atual sobre o total de passos de preenchimento
+                progresso_percentual = (passo_atual_idx) / total_passos_preenchimento if total_passos_preenchimento > 0 else 0
                 st.progress(progresso_percentual)
                 titulo_passo_formatado = nome_passo_atual.replace('_', ' ').title()
-                st.markdown(f"#### Etapa de Preenchimento: **{titulo_passo_formatado}** (Passo {passo_atual_idx + 1} de {len(FORM_STEPS)-1})")
+                st.markdown(f"#### Etapa de Preenchimento: **{titulo_passo_formatado}** (Passo {passo_atual_idx + 1} de {total_passos_preenchimento})")
             else: # Etapa de Revisão
                  st.markdown(f"#### Etapa Final: **Revisar Dados e Iniciar Simulação** (Passo {len(FORM_STEPS)} de {len(FORM_STEPS)})")
             st.markdown("---")
         # --- Fim do Indicador de Progresso ---
 
-            current_step_key = FORM_STEPS[passo_atual_idx] # Reconfirmar, já que usamos nome_passo_atual
+            current_step_key = FORM_STEPS[passo_atual_idx] 
             if current_step_key == "autor": exibir_formulario_qualificacao_autor()
             elif current_step_key == "reu": exibir_formulario_qualificacao_reu()
-            elif current_step_key == "natureza_acao": exibir_formulario_natureza_acao()
             elif current_step_key == "fatos": exibir_formulario_fatos()
             elif current_step_key == "direito": exibir_formulario_direito()
             elif current_step_key == "pedidos": exibir_formulario_pedidos()
+            elif current_step_key == "natureza_acao": exibir_formulario_natureza_acao() # MODIFICADO: Chamada correta
+            elif current_step_key == "documentos_autor": exibir_formulario_documentos_autor() # NOVO: Chamada correta
             elif current_step_key == "revisar_e_simular": exibir_revisao_e_iniciar_simulacao()
-            else: # --- Else para Robustez ---
+            else: 
                 st.error(f"🔴 ERRO INTERNO: Etapa do formulário desconhecida ou não tratada: '{current_step_key}'.")
                 st.warning("Por favor, tente reiniciar a simulação a partir do menu lateral.")
-        else: # Índice fora do esperado
+        else: 
             st.error("🔴 ERRO INTERNO: Índice da etapa do formulário inválido. Tentando reiniciar...")
-            st.session_state.current_form_step_index = 0 # Reseta para o início
+            st.session_state.current_form_step_index = 0 
             st.rerun()
