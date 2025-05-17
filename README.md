@@ -1,19 +1,22 @@
 # IA-Mestra: Simulação Jurídica Avançada ⚖️✨
 Projeto Desenvolvido para a Imersão IA Alura + Google (12-16 de Maio de 2025)
 
-Veja o Video Pitch em https://youtu.be/BhHUIHstGKg?si=TTxu1AIDXFD3I6EM
+Considerando que os critérios de avaliação envolvem o critério "apresentação":
 
-Projeto em produção temporariamente, acesse via
+- Veja o Video Pitch em https://youtu.be/BhHUIHstGKg?si=TTxu1AIDXFD3I6EM
+
+- Projeto em produção temporariamente, acesse via
 https://dsid2024-simulacao-juridica-main-app-2cxrtg.streamlit.app/
 
 Faça bom uso, pois o histórico das interações poderá ser visto pelo LangSmith.
 ATENÇÃO: a API do Google Search e do Gemini têm limitações, então algum item
 pode deixar de funcionar por excesso de requisições.
 
-
 Este projeto é um protótipo/MVP que explora o potencial da Inteligência Artificial no domínio jurídico, com foco na simulação de fluxos processuais e na assistência inteligente a profissionais e estudantes de Direito, usando
 agentes de IA com prompts modelados, RAG, tool de search encadeados.
 
+O escopo envolve usar o conteúdo do curso, relativo ao Gemini, com criação de agentes e sistema multiagentes, com uso de Python e dos frameworks mencionados na documentação do Gemini (vide Frameworks de código aberto):
+https://ai.google.dev/gemini-api/docs?hl=pt-br
 
 # Olá, Comunidade Alura e Google! 👋
 644.606 tokens gastos e 356 runs depois, é com grande entusiasmo que apresento o IA-Mestra, unindo Google, agentes e o universo do Direito. Desenvolvido com o auxílio fundamental da IA Gemini e aplicando os conceitos transformadores sobre agentes inteligentes que exploramos durante esta Imersão IA, o IA-Mestra vai além da teoria.
@@ -22,15 +25,15 @@ Este simulador é um protótipo que demonstra, na prática, como a Inteligência
 
 Trouxe um pouco da minha experiência a serviço do Tribunal de Justiça de São Paulo, espero que gostem.
 
-# Vote no IA-Mestra! Seu Apoio Faz a Diferença! 🚀
-Se você acredita no potencial do IA-Mestra e na importância de inovar no campo jurídico com Inteligência Artificial, seu voto é muito importante!
-
-Este projeto visa ser uma ferramenta que possa, de fato, auxiliar no desenvolvimento de futuros e atuais profissionais do Direito. 
+# Uso
+Este projeto visa ser uma ferramenta que possa, de fato, auxiliar no desenvolvimento de futuros e atuais profissionais do Direito, bem como uma forma de a população em geral conseguir simular suas demandas e tirar suas
+dúvidas, em geral, de maneira mais interativa e ilustrativa do que procurar na internet,
+perguntar para chatbots e etc.
 
 Vejamos.
 
 # O Desafio que o IA-Mestra Busca Endereçar 🎯
-O Direito é complexo. Para estudantes, visualizar o trâmite de um processo e a interconexão das peças pode ser abstrato. Para advogados, especialmente os em início de carreira, desenvolver o raciocínio estratégico, prever desdobramentos e redigir peças iniciais de qualidade consome tempo e exige prática. Como a IA pode auxiliar?
+O Direito é complexo. Para pessoas em geral, estudantes, visualizar o trâmite de um processo e a interconexão das peças pode ser abstrato. Para advogados, especialmente os em início de carreira, desenvolver o raciocínio estratégico, prever desdobramentos e redigir peças iniciais de qualidade consome tempo e exige prática. Como a IA pode auxiliar?
 
 A Solução: IA-Mestra - Seu Assistente Jurídico Inteligente 💡
 O IA-Mestra é um simulador processual avançado que utiliza um sistema de agentes inteligentes para:
@@ -179,6 +182,5 @@ E muito mais, conforme explorado em nossa análise MoSCoW! (Os placeholders * na
 À IA Gemini, que não só é o motor deste simulador, mas também foi uma ferramenta de auxílio valiosa durante todo o processo de desenvolvimento.
 A todos os instrutores e colegas da Imersão pelo aprendizado compartilhado.
 
-# Vote no IA-Mestra! Peço novamente, pois seu apoio faz a diferença! 🚀
 
 Muito obrigado!
