@@ -1,7 +1,18 @@
 # IA-Mestra: Simulação Jurídica Avançada ⚖️✨
 Projeto Desenvolvido para a Imersão IA Alura + Google (12-16 de Maio de 2025)
 
-Este projeto é um protótipo/MVP que explora o potencial da Inteligência Artificial no domínio jurídico, com foco na simulação de fluxos processuais e na assistência inteligente a profissionais e estudantes de Direito.
+Veja o Video Pitch em https://youtu.be/BhHUIHstGKg?si=TTxu1AIDXFD3I6EM
+
+Projeto em produção temporariamente, acesse via
+https://dsid2024-simulacao-juridica-main-app-2cxrtg.streamlit.app/
+
+Faça bom uso, pois o histórico das interações poderá ser visto pelo LangSmith.
+ATENÇÃO: a API do Google Search e do Gemini têm limitações, então algum item
+pode deixar de funcionar por excesso de requisições.
+
+
+Este projeto é um protótipo/MVP que explora o potencial da Inteligência Artificial no domínio jurídico, com foco na simulação de fluxos processuais e na assistência inteligente a profissionais e estudantes de Direito, usando
+agentes de IA com prompts modelados, RAG, tool de search encadeados.
 
 
 # Olá, Comunidade Alura e Google! 👋
